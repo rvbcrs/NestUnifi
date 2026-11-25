@@ -66,6 +66,13 @@ class Routes(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/login", "{}", **dict(self.browser, Origin="https://" + self.host))[0], 200)
         self.assertIn("; Secure;", self.answer.getheader("Set-Cookie"))
 
+    def test_choosing_a_new_password_ends_every_earlier_session(self):
+        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 200)
+        self.assertEqual(self.request("POST", "/api/claim", "{}", Cookie="", **self.browser)[0], 200)
+        fresh = self.answer.getheader("Set-Cookie").split(";")[0]
+        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 401)
+        self.assertEqual(self.request("POST", "/api/list", "{}", Cookie=fresh, **self.browser)[0], 200)
+
     def test_google_return_address_serves_the_page(self):
         page = self.request("GET", "/")[1]
         self.assertEqual(self.request("GET", "/oauth2callback?state=s&code=4%2Fabc"), (200, page))

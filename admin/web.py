@@ -152,6 +152,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(409, {"error": response["error"]})
         result, cookie = response["result"], None
         if action in ("claim", "login"):
+            if action == "claim":
+                SESSIONS.clear()  # A new password was chosen. Sessions from the previous one end here.
             token = secrets.token_urlsafe(32)
             SESSIONS[token] = time.time() + LIFETIME
             cookie = token + "; Max-Age=%d" % LIFETIME + ("; Secure" if self.headers["Origin"].startswith("https://") else "")
