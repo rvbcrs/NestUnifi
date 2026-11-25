@@ -73,6 +73,13 @@ class Routes(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 401)
         self.assertEqual(self.request("POST", "/api/list", "{}", Cookie=fresh, **self.browser)[0], 200)
 
+    def test_session_survives_cookies_of_other_apps_on_the_same_address(self):
+        # Browsers send the cookies of every port of an address. Other apps on a NAS set values that
+        # Python's cookie parser cannot read, and that parser then drops every cookie after them.
+        for others in ('prefs={"theme":"dark"}', "greeting=hello world", "ui[sidebar]=1", 'q="a;b"', "flag", "=x"):
+            header = others + "; " + self.cookie + "; last=1"
+            self.assertEqual(self.request("POST", "/api/list", "{}", **dict(self.browser, Cookie=header))[0], 200, others)
+
     def test_google_return_address_serves_the_page(self):
         page = self.request("GET", "/")[1]
         self.assertEqual(self.request("GET", "/oauth2callback?state=s&code=4%2Fabc"), (200, page))

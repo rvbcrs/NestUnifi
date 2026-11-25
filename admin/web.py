@@ -1,5 +1,4 @@
 """Camera management for browsers on the local network."""
-import http.cookies
 import ipaddress
 import json
 import os
@@ -74,11 +73,14 @@ class Handler(BaseHTTPRequestHandler):
         return not ipaddress.ip_address(self.client_address[0]).is_global
 
     def session(self):
-        try:
-            cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", "")).get("nestunifi")
-        except http.cookies.CookieError:
-            cookie = None
-        token = cookie.value if cookie else ""
+        # Browsers also send the cookies of other apps on this address, whatever their port. Python's cookie
+        # parser silently drops everything after a value it cannot read, so only our own pair is looked up.
+        token = ""
+        for pair in ";".join(self.headers.get_all("Cookie") or []).split(";"):
+            name, _, value = pair.strip().partition("=")
+            if name == "nestunifi" and value in SESSIONS:
+                token = value
+                break
         if SESSIONS.get(token, 0) > time.time():
             return token
         SESSIONS.pop(token, None)
