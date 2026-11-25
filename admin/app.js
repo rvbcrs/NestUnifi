@@ -14,6 +14,8 @@ function message(id, value = "", error = false) {
 async function api(action, data = {}) {
   const r = await fetch("/api/" + action, {method: "POST", headers: {"Content-Type": "application/json", "X-NestUnifi": "1"}, body: JSON.stringify(data)});
   const json = await r.json().catch(() => ({}));
+  // The session ended, for example after a restart. Ask for the password again.
+  if (r.status === 401) showAccess(true);
   if (!r.ok) throw new Error(json.error || "NestUnifi is niet bereikbaar.");
   return json;
 }
@@ -533,12 +535,49 @@ el("openSetup").onclick = async () => {
     showSetup();
   } catch (e) { message("notice", e.message, true); }
 };
+// The first visitor chooses the admin password. After that every visit starts by signing in.
+function showAccess(claimed) {
+  for (const id of ["setup", "overview", "bridge", "openSetup", "signOut"]) el(id).hidden = true;
+  if (el("modal").open) el("modal").close();
+  el("access").hidden = false;
+  el("accessTitle").textContent = claimed ? "Aanmelden" : "Welkom bij NestUnifi";
+  el("accessHint").textContent = claimed ? "Vul je beheerwachtwoord in." : "Kies eerst een beheerwachtwoord. Daarmee meld je je voortaan aan op deze pagina.";
+  const form = el("accessForm"), fields = [];
+  form.replaceChildren();
+  for (const [id, title] of claimed ? [["adminPassword", "Beheerwachtwoord"]] : [["adminPassword", "Nieuw beheerwachtwoord"], ["adminRepeat", "Herhaal het wachtwoord"]]) {
+    const [label, input] = entry(id, title, "password");
+    input.autocomplete = claimed ? "current-password" : "new-password";
+    input.minLength = 10;
+    input.maxLength = 128;
+    fields.push(input);
+    form.append(label, input);
+  }
+  const status = make("p", undefined, "message");
+  status.setAttribute("role", "status");
+  form.append(claimed ? make("p", "Wachtwoord vergeten? Verwijder het bestand private/admin/auth.json op het systeem waar NestUnifi draait en vernieuw deze pagina.") : make("p", "Gebruik minstens 10 tekens."), submit(claimed ? "Aanmelden" : "Wachtwoord instellen"), status);
+  form.onsubmit = e => {
+    e.preventDefault();
+    act(form, "Controleren…", async () => {
+      if (!claimed && fields[0].value !== fields[1].value) throw new Error("De wachtwoorden verschillen.");
+      await api(claimed ? "login" : "claim", {password: fields[0].value});
+      el("access").hidden = true;
+      await start();
+    });
+  };
+}
+el("signOut").onclick = async () => {
+  await api("logout").catch(() => {});
+  showAccess(true);
+};
 async function start() {
   const back = new URLSearchParams(location.search), returning = location.pathname === "/oauth2callback";
   let note;
   // Take the one-time code out of the address bar and the history before anything else.
   if (returning) history.replaceState(null, "", "/");
   try {
+    const access = await api("auth");
+    if (!access.claimed || !access.signed_in) return showAccess(access.claimed);
+    el("signOut").hidden = false;
     if (returning && back.get("code")) {
       message("notice", "Koppeling met Google afronden. Dit kan een minuut duren…");
       try { setupState = await api("code", {code: back.get("code"), state: back.get("state")}); }

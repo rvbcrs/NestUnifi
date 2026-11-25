@@ -1,10 +1,13 @@
 """Camera management for browsers on the local network."""
+import http.cookies
 import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import socketserver
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
@@ -18,7 +21,11 @@ MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
 ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "view",
-           "setup", "client", "project", "consent", "code"}
+           "setup", "client", "project", "consent", "code", "auth", "claim", "login", "logout"}
+# Everything else needs a session. A session starts when the worker accepts the admin password.
+OPEN = {"auth", "claim", "login", "logout"}
+SESSIONS = {}
+LIFETIME = 30 * 24 * 3600
 # Google returns the browser to /oauth2callback with the code in the query. The page itself hands it in.
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/oauth2callback": ("index.html", "text/html; charset=utf-8"),
           "/app.css": ("app.css", "text/css"), "/app.js": ("app.js", "text/javascript")}
@@ -35,10 +42,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, status, data=b"", mime="application/json"):
+    def reply(self, status, data=b"", mime="application/json", cookie=None):
         if not isinstance(data, bytes):
             data = json.dumps(data).encode()
         self.send_response(status)
+        if cookie is not None:
+            self.send_header("Set-Cookie", "nestunifi=" + cookie + "; Path=/; HttpOnly; SameSite=Strict")
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -49,11 +58,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def local(self):
-        """The page has no login. It answers visitors that are not on the public internet (the home network, a
-        VPN, this system itself) and that address it by IP or by a listed name.
+        """A first barrier before the login: visitors that are not on the public internet (the home network, a
+        VPN, this system itself) and that address the page by IP or by a listed name.
 
         A page elsewhere on the web can point a host name of its own at this address and reach it through the
-        visitor's browser. Such a request carries that name, so an unknown name is refused.
+        visitor's browser. Such a request carries that name, so an unknown name is refused. Behind a reverse
+        proxy every visitor has the proxy's address, so this check is never the only protection.
         """
         host = urlsplit("//" + self.headers.get("Host", "")).hostname or ""
         try:
@@ -62,6 +72,17 @@ class Handler(BaseHTTPRequestHandler):
             if host != "localhost" and host not in NAMES:
                 return False
         return not ipaddress.ip_address(self.client_address[0]).is_global
+
+    def session(self):
+        try:
+            cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", "")).get("nestunifi")
+        except http.cookies.CookieError:
+            cookie = None
+        token = cookie.value if cookie else ""
+        if SESSIONS.get(token, 0) > time.time():
+            return token
+        SESSIONS.pop(token, None)
+        return ""
 
     def refuse(self):
         self.reply(403, "Open NestUnifi vanaf je thuisnetwerk via het IP-adres van dit systeem. Gebruik je een eigen "
@@ -82,6 +103,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.refuse()
         match = LIVE.fullmatch(self.path)
         if match:
+            if not self.session():
+                return self.reply(401, {})
             return self.video(match[1], match[2])
         path = urlsplit(self.path).path
         if path not in STATIC or (path != self.path and path != "/oauth2callback"):
@@ -109,6 +132,12 @@ class Handler(BaseHTTPRequestHandler):
         action = self.path.removeprefix("/api/")
         if self.path != "/api/"+action or action not in ACTIONS:
             return self.reply(404, {})
+        token = self.session()
+        if action == "logout":
+            SESSIONS.pop(token, None)
+            return self.reply(200, {}, cookie="; Max-Age=0")
+        if action not in OPEN and not token:
+            return self.reply(401, {"error": "Meld je aan om verder te gaan."})
         try:
             with socket.socket(socket.AF_UNIX) as conn:
                 conn.settimeout(200)
@@ -121,7 +150,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(503, {"error": "De beheerservice is niet bereikbaar. Vernieuw het overzicht."})
         if not response["ok"]:
             return self.reply(409, {"error": response["error"]})
-        self.reply(200, response["result"])
+        result, cookie = response["result"], None
+        if action in ("claim", "login"):
+            token = secrets.token_urlsafe(32)
+            SESSIONS[token] = time.time() + LIFETIME
+            cookie = token + "; Max-Age=%d" % LIFETIME + ("; Secure" if self.headers["Origin"].startswith("https://") else "")
+        if action == "auth":
+            result = dict(result, signed_in=bool(token))
+        self.reply(200, result, cookie=cookie)
 
 
 class Web(socketserver.ThreadingMixIn, socketserver.TCPServer):

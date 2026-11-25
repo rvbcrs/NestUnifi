@@ -132,6 +132,28 @@ class Wizard(unittest.TestCase):
         self.assertNotEqual(fresh, media["authInternalUsers"][0]["pass"])
         self.assertIn(":" + fresh + "@", worker.read(worker.BRIDGE)["media"]["rtsp_base_url"])
 
+    def test_admin_password_is_chosen_once_and_guessing_is_slowed(self):
+        self.addCleanup(worker.attempts.update, failed=0, until=0.0)
+        self.assertEqual(self.ask("auth"), {"claimed": False})
+        with self.assertRaisesRegex(worker.Problem, "10 tot 128"):
+            self.ask("claim", password="te kort")
+        with self.assertRaisesRegex(worker.Problem, "nog geen"):
+            self.ask("login", password="geheim-wachtwoord")
+        self.ask("claim", password="geheim-wachtwoord")
+        self.assertEqual(self.ask("auth"), {"claimed": True})
+        self.assertNotIn("geheim", worker.AUTH.read_text())
+        with self.assertRaisesRegex(worker.Problem, "al een beheerwachtwoord"):
+            self.ask("claim", password="ander-wachtwoord")
+        self.assertEqual(self.ask("login", password="geheim-wachtwoord"), {})
+        for _ in range(5):
+            with self.assertRaisesRegex(worker.Problem, "Onjuist"):
+                self.ask("login", password="verkeerd-wachtwoord")
+        with self.assertRaisesRegex(worker.Problem, "Te veel pogingen"):
+            self.ask("login", password="geheim-wachtwoord")
+        worker.attempts["until"] = 0.0
+        self.assertEqual(self.ask("login", password="geheim-wachtwoord"), {})
+        self.assertEqual(worker.attempts["failed"], 0)
+
     def test_second_cloud_run_reuses_what_exists(self):
         self.ask("client", client_id=CLIENT, client_secret="GOCSPX-0123456789abcdef")
         for _ in range(2):

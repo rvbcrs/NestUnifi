@@ -36,14 +36,35 @@ class Routes(unittest.TestCase):
         mock.start()
         self.addCleanup(mock.stop)
         self.host = "127.0.0.1:%d" % self.servers[1].server_address[1]
+        self.browser = {"Origin": "http://" + self.host, "X-NestUnifi": "1", "Content-Type": "application/json"}
+        self.cookie = ""
+        self.assertEqual(self.request("POST", "/api/login", '{"password": "geheim-wachtwoord"}', **self.browser)[0], 200)
+        self.cookie = self.answer.getheader("Set-Cookie").split(";")[0]
         Worker.seen.clear()
 
     def request(self, method, path, body=None, **headers):
         conn = http.client.HTTPConnection(self.host, timeout=5)
         self.addCleanup(conn.close)
-        conn.request(method, path, body, headers)
-        response = conn.getresponse()
-        return response.status, response.read()
+        conn.request(method, path, body, dict({"Cookie": self.cookie}, **headers))
+        self.answer = conn.getresponse()
+        return self.answer.status, self.answer.read()
+
+    def test_nothing_but_the_login_works_without_a_session(self):
+        rules = self.answer.getheader("Set-Cookie")
+        self.assertRegex(rules, r"^nestunifi=[A-Za-z0-9_-]{40,}; Max-Age=\d+; Path=/; HttpOnly; SameSite=Strict$")
+        stranger = dict(self.browser, Cookie="nestunifi=" + "a" * 43)
+        self.assertEqual(self.request("POST", "/api/list", "{}", **stranger)[0], 401)
+        self.assertEqual(self.request("GET", "/live/cam-a/index.m3u8", Cookie="")[0], 401)
+        self.assertEqual(self.request("GET", "/", Cookie="")[0], 200)
+        self.assertEqual(Worker.seen, [])
+        self.assertEqual(self.request("POST", "/api/auth", "{}", **stranger), (200, b'{"linked": false, "signed_in": false}'))
+        self.assertEqual(self.request("POST", "/api/auth", "{}", **self.browser), (200, b'{"linked": false, "signed_in": true}'))
+        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 200)
+        self.assertEqual(self.request("POST", "/api/logout", "{}", **self.browser)[0], 200)
+        self.assertIn("Max-Age=0", self.answer.getheader("Set-Cookie"))
+        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 401)
+        self.assertEqual(self.request("POST", "/api/login", "{}", **dict(self.browser, Origin="https://" + self.host))[0], 200)
+        self.assertIn("; Secure;", self.answer.getheader("Set-Cookie"))
 
     def test_google_return_address_serves_the_page(self):
         page = self.request("GET", "/")[1]
