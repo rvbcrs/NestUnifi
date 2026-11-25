@@ -52,8 +52,9 @@ De naam van de interface vind je met `ip -4 route show default`, achter het woor
 - **Beheerwachtwoord.** Wie de pagina als eerste opent, kiest het wachtwoord. Doe dat dus direct na het
   installeren. Vergeten? Verwijder het bestand `private/admin/auth.json` en vernieuw de pagina; je camera's en de
   koppeling met Google blijven staan. Zet de poort niet open in je router.
-- **Vaste adressen.** Elke camera vraagt zelf een adres aan bij je router. Leg die adressen in je router vast,
-  zodat Protect de camera's na een herstart terugvindt.
+- **Vaste adressen.** Elke camera vraagt zelf een adres aan bij je router, en na een herstart hetzelfde adres
+  opnieuw. De meeste routers geven het dan terug, zodat Protect de camera's terugvindt. Wil je zekerheid, leg
+  de adressen dan ook in je router vast.
 - **Dit systeem zelf bereikt de camera-adressen niet.** Dat hoort bij deze netwerktechniek. Andere apparaten
   in je netwerk, zoals je UniFi-recorder, bereiken ze wel.
 - **Gebruik je al een macvlan-netwerk in Docker op dezelfde interface** (bijvoorbeeld voor Pi-hole)? Docker
@@ -61,7 +62,12 @@ De naam van de interface vind je met `ip -4 route show default`, achter het woor
   `external: true` en `name: <naam van je bestaande netwerk>`. Een ipvlan-netwerk is niet geschikt.
 - **Je gegevens** staan in de map `private/`, inclusief de koppeling met Google. Neem die map mee in je back-up
   en deel haar met niemand.
+- **Back-up en verhuizen.** Onder het tandwiel op de beheerpagina download je een back-up van je instellingen en
+  de koppeling met Google. Op een nieuw systeem zet je die daar terug, voordat je camera's toevoegt. Zet
+  NestUnifi op het oude systeem eerst uit: beide zouden dezelfde netwerkadressen gebruiken.
 - **Bijwerken:** draai `sh install.sh` opnieuw. Het haalt de nieuwste versie op; je instellingen blijven staan.
+  De beheerpagina meldt wanneer er een nieuwe versie is. Daarvoor vraagt NestUnifi eens per dag de lijst met
+  versies op bij `ghcr.io`.
 
 ## Zelf bouwen
 

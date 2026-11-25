@@ -426,6 +426,51 @@ select:focus {
 .notice {
   color: #e6d3fd;
 }
+.health {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid #ffb8bc59;
+  border-radius: 12px;
+  background: #ff5a6a14;
+}
+.health p {
+  flex: 1 1 320px;
+  margin: 0;
+  color: #ffd6d9;
+  font-size: 14px;
+}
+.update {
+  margin: 0 0 16px;
+  color: #bdf3dc;
+  font-size: 14px;
+}
+.backup {
+  max-width: 760px;
+  margin-top: 24px;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #ffffff08;
+}
+.backup h2 {
+  font-size: 18px;
+}
+.backup p {
+  color: var(--muted);
+  font-size: 14px;
+}
+.primary.danger {
+  background: #a3324a;
+  border-color: #e0687f;
+}
+.primary.danger:hover {
+  background: #b83a55;
+}
 video {
   width: 100%;
   display: block;

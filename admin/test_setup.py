@@ -20,7 +20,7 @@ class Google:
     def __init__(self):
         self.calls, self.made, self.policies = [], set(), {}
 
-    def __call__(self, method, url, token=None, body=None, form=None):
+    def __call__(self, method, url, token=None, body=None, form=None, timeout=None):
         self.calls.append((method, url))
         if url == google_api.TOKEN:
             return 200, {"access_token": "access", "expires_in": 3599, "refresh_token": "refresh"}
@@ -61,6 +61,7 @@ class Wizard(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
         worker.bootstrap()
+        self.addCleanup(worker.link_check.update, until=0.0, value=None)
 
     def ask(self, action, **fields):
         return worker.dispatch(dict(fields, action=action, origin=ORIGIN))
@@ -117,6 +118,84 @@ class Wizard(unittest.TestCase):
         self.assertEqual(publisher["permissions"], [{"action": "publish", "path": path}])
         self.assertEqual(reader["permissions"], [{"action": "read", "path": path}])
         self.assertEqual(self.ask("setup")["cameras"], 1)
+
+    def test_link_check_follows_google_and_relinking_restarts_the_bridge(self):
+        self.assertIsNone(worker.google_link())
+        self.ask("client", client_id=CLIENT, client_secret="GOCSPX-0123456789abcdef")
+        self.ask("project", project=PROJECT)
+        self.ask("code", code="4/ijklmnop", state=self.consent("link")[1])
+        previous = worker.google_link()
+        self.assertEqual(previous, "ok")
+        for answer, verdict in [((400, {"error": "invalid_grant"}), "revoked"), ((401, {"error": "invalid_client"}), "client"),
+                                ((503, {}), "unreachable")]:
+            with patch.object(google_api, "send", lambda *a, **k: answer):
+                self.assertEqual(worker.google_link(), previous)  # Google is asked again only after a while.
+                worker.link_check["until"] = 0.0
+                previous = worker.google_link()
+                self.assertEqual(previous, verdict)
+        with patch.object(google_api, "send", side_effect=google_api.Failure("offline")):
+            worker.link_check["until"] = 0.0
+            self.assertEqual(worker.google_link(), "unreachable")
+        # A new link replaces the token the running bridge holds, and the verdict follows at once.
+        before = worker.BRIDGE.stat().st_mtime_ns
+        self.ask("code", code="4/ijklmnop", state=self.consent("link")[1])
+        self.assertNotEqual(worker.BRIDGE.stat().st_mtime_ns, before)
+        self.assertEqual(worker.google_link(), "ok")
+
+    def linked_with_camera(self):
+        self.ask("client", client_id=CLIENT, client_secret="GOCSPX-0123456789abcdef")
+        self.ask("code", code="4/abcdefgh", state=self.consent("cloud")[1])
+        self.ask("project", project=PROJECT)
+        self.ask("code", code="4/ijklmnop", state=self.consent("link")[1])
+        self.ask("add", id=self.ask("discover")["available"][0]["id"], name="Tuin", password="tuin-camera-1")
+        worker.replace(worker.ONVIF.parent / "addresses.json", {"02:aa:bb:cc:dd:ee": "192.168.1.40"})
+
+    def fresh_installation(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.chdir(tmp.name)
+        worker.bootstrap()
+
+    def test_backup_moves_to_a_new_installation(self):
+        self.linked_with_camera()
+        worker.replace(worker.AUTH, {"salt": "00", "hash": "geheim"})
+        saved = json.loads(json.dumps(self.ask("backup")))
+        self.assertNotIn("admin/auth.json", saved["files"])
+        old = {name: worker.read(path) for name, (path, _) in worker.BACKUP.items()}
+        self.fresh_installation()
+        key = worker.read(worker.MEDIA)["hlsCDNSecret"]
+        for broken in ({}, {"nestunifi": 1, "files": {"bridge/config.yaml": {}}},
+                       {"nestunifi": 1, "files": dict(saved["files"], **{"admin/auth.json": {}})},
+                       {"nestunifi": 1, "files": dict(saved["files"], **{"onvif/config.yaml": {"devices": []}})},
+                       {"nestunifi": 1, "files": dict(saved["files"], **{"bridge/config.yaml": dict(
+                           saved["files"]["bridge/config.yaml"], media={"rtsp_base_url": "rtsp://bridge:x@192.0.2.1:8554"})})}):
+            with self.assertRaisesRegex(worker.Problem, "geen back-up|onvolledig"):
+                self.ask("restore", backup=broken)
+        self.assertFalse(worker.TOKENS.exists())
+        # A hook in the media configuration would run a command. Only NestUnifi's own fields come back.
+        media = saved["files"]["media/mediamtx.yml"]
+        media.update(runOnInit="touch /tmp/owned", paths={p: {"runOnReady": "sh"} for p in media["paths"]})
+        state = self.ask("restore", backup=saved)
+        self.assertEqual((state["linked"], state["cameras"], state["cloud"]), (True, 1, True))
+        for name, (path, _) in worker.BACKUP.items():
+            expected = dict(old[name], hlsCDNSecret=key) if path == worker.MEDIA else old[name]
+            self.assertEqual(worker.read(path), expected, name)
+        self.assertNotIn("runOnInit", worker.read(worker.MEDIA))
+        self.assertFalse(worker.AUTH.exists() or worker.PENDING.exists())
+        with self.assertRaisesRegex(worker.Problem, "zonder camera"):
+            self.ask("restore", backup=saved)
+
+    def test_failed_restore_leaves_the_new_installation_as_it_was(self):
+        self.linked_with_camera()
+        saved = self.ask("backup")
+        self.fresh_installation()
+        before = {path: path.read_text() for path, _ in worker.BACKUP.values() if path.exists()}
+        with patch.object(worker, "ready", side_effect=[worker.Problem("start mislukt"), None]):
+            with self.assertRaises(worker.Problem):
+                self.ask("restore", backup=saved)
+        self.assertEqual({path: path.read_text() for path, _ in worker.BACKUP.values() if path.exists()},
+                         {path: json.dumps(json.loads(text), ensure_ascii=False, indent=2) for path, text in before.items()})
+        self.assertFalse(worker.TOKENS.exists() or worker.PENDING.exists())
 
     def test_first_start_is_written_once_and_ready_for_the_media_server(self):
         media, bridge = worker.read(worker.MEDIA), worker.read(worker.BRIDGE)

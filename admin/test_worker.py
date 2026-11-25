@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import worker
+from suite import runtime
 from suite.runtime import device_config, lan_interface
 
 
@@ -25,7 +26,8 @@ class CameraChanges(unittest.TestCase):
                                    "streams": [{"rtsp": "rtsp://test:fixture@mediamtx:8554/cam-keuken-camera",
                                                 "width": 1920, "height": 1080, "framerate": 15, "bitrate": 1000}]}]}
         self.bridge = {"cameras": [{"device_id": old_id, "name": "Keuken camera",
-                                    "onvif": {"ip": "127.0.0.1"}}]}
+                                    "onvif": {"ip": "127.0.0.1"}}],
+                       "media": {"rtsp_base_url": "rtsp://publisher:fixture@127.0.0.1:8554"}}
         self.media = {"paths": {"cam-keuken-camera": {}}, "authInternalUsers": [
             {"user": "test" if a == "read" else "publisher", "pass": "fixture",
              "permissions": [{"action": a, "path": "cam-keuken-camera"}]} for a in ("read", "publish")]}
@@ -60,6 +62,32 @@ class CameraChanges(unittest.TestCase):
                       links[:2] + [{"ifname": "eth1", "linkinfo": {"info_kind": "ipvlan"}}]):
             with self.assertRaisesRegex(SystemExit, "NESTUNIFI_LAN_INTERFACE"):
                 lan_interface(wrong)
+
+    def test_cameras_ask_for_their_last_address_again(self):
+        with patch.object(runtime, "ADDRESSES", Path("addresses.json")):
+            self.assertEqual(runtime.remembered(), {})
+            runtime.remember("02:aa", "192.168.1.40")
+            runtime.remember("02:bb", "192.168.1.41")
+            runtime.remember("02:aa", "192.168.1.42")
+            self.assertEqual(runtime.remembered(), {"02:aa": "192.168.1.42", "02:bb": "192.168.1.41"})
+            runtime.ADDRESSES.write_text("[")
+            self.assertEqual(runtime.remembered(), {})
+
+    def test_update_is_offered_only_for_a_newer_release(self):
+        self.addCleanup(worker.update_check.update, until=0.0, value=None)
+        tags = ["latest", "2026.11.20", "2026.12.01", "dev"]
+        published = lambda: [t for t in tags if worker.RELEASE.fullmatch(t)]
+        with patch.multiple(worker, VERSION="2026.11.25", REPOSITORY="owner/nestunifi", published_versions=published):
+            self.assertEqual(worker.newer_version(), "2026.12.01")
+            tags.append("2027.01.01")
+            self.assertEqual(worker.newer_version(), "2026.12.01")  # Asked again only the next day.
+            worker.update_check["until"] = 0.0
+            self.assertEqual(worker.newer_version(), "2027.01.01")
+        with patch.multiple(worker, VERSION="2027.01.01", REPOSITORY="owner/nestunifi", published_versions=published):
+            worker.update_check["until"] = 0.0
+            self.assertIsNone(worker.newer_version())
+        with patch.multiple(worker, VERSION="dev", REPOSITORY="owner/nestunifi"):
+            self.assertIsNone(worker.newer_version())
 
     def test_profile_updates_only_advertised_dimensions(self):
         worker.change("profile", {"id": "fixed-id"})
@@ -133,6 +161,37 @@ class CameraChanges(unittest.TestCase):
                 worker.change("password", {"id": "fixed-id", "password": "new-test-123"})
         self.assertEqual(worker.read(worker.MEDIA), self.media)
         self.assertEqual(worker.read(worker.ONVIF), self.onvif)
+        self.assertFalse(worker.PENDING.exists())
+
+    def test_remove_clears_every_layer_and_keeps_the_publisher(self):
+        worker.change("add", self.req)
+        added = worker.read(worker.ONVIF)["devices"][-1]
+        self.assertEqual(worker.change("remove", {"id": "fixed-id"}), {"name": "Keuken camera", "removed": True})
+        self.assertEqual(worker.read(worker.ONVIF)["devices"], [added])
+        self.assertEqual([c["device_id"] for c in worker.read(worker.BRIDGE)["cameras"]], [self.dev["device_id"]])
+        media = worker.read(worker.MEDIA)
+        self.assertEqual(list(media["paths"]), ["cam-" + added["name"]])
+        self.assertFalse(any(rule["path"] == "cam-keuken-camera" for u in media["authInternalUsers"] for rule in u["permissions"]))
+        worker.change("remove", {"id": added["uuid"]})
+        media = worker.read(worker.MEDIA)
+        # The next camera finds its publisher again, even with no camera left to copy from.
+        self.assertEqual(media["authInternalUsers"], [{"user": "publisher", "pass": "fixture", "permissions": []}])
+        self.assertEqual((worker.read(worker.ONVIF)["devices"], worker.read(worker.BRIDGE)["cameras"], media["paths"]), ([], [], {}))
+        self.assertFalse(worker.PENDING.exists())
+        worker.change("add", self.req)
+        self.assertEqual(len(worker.read(worker.ONVIF)["devices"]), 1)
+
+    def test_failed_remove_restores_an_offline_camera(self):
+        waits = []
+        def ready(cam=None):
+            waits.append(cam)
+            if len(waits) == 1:
+                raise worker.Problem("start mislukt")
+        with patch.object(worker, "ready", ready), self.assertRaises(worker.Problem):
+            worker.change("remove", {"id": "fixed-id"})
+        self.assertEqual(waits, [None, None])
+        for path, expected in [(worker.BRIDGE, self.bridge), (worker.ONVIF, self.onvif), (worker.MEDIA, self.media)]:
+            self.assertEqual(expected, worker.read(path))
         self.assertFalse(worker.PENDING.exists())
 
     def test_failed_add_restores_previous_config(self):

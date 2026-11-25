@@ -25,7 +25,7 @@ class Failure(Exception):
     pass
 
 
-def send(method, url, token=None, body=None, form=None):
+def send(method, url, token=None, body=None, form=None, timeout=25):
     headers = {"Accept": "application/json"}
     data = None
     if form is not None:
@@ -38,7 +38,7 @@ def send(method, url, token=None, body=None, form=None):
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=25) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             status, raw = response.status, response.read()
     except urllib.error.HTTPError as exc:
         status, raw = exc.code, exc.read()
@@ -91,6 +91,25 @@ def exchange(client_id, client_secret, redirect, code):
         raise Failure("Google heeft de koppeling geweigerd (" + (reason(answer) or "HTTP " + str(status)) +
                       "). Controleer client-ID, clientgeheim en redirect-URI en start de koppeling opnieuw.")
     return answer
+
+
+def check(client_id, client_secret, refresh_token):
+    """Ask for a fresh access token and keep only the verdict: "ok", "revoked" (the consent ended or expired),
+    "client" (the OAuth client was deleted or its secret changed) or "unreachable"."""
+    try:
+        status, answer = send("POST", TOKEN, form={"client_id": client_id, "client_secret": client_secret,
+                                                   "refresh_token": refresh_token, "grant_type": "refresh_token"},
+                              timeout=8)
+    except Failure:
+        return "unreachable"
+    if status == 200 and answer.get("access_token"):
+        return "ok"
+    error = answer.get("error")
+    if error == "invalid_grant":
+        return "revoked"
+    if error in ("invalid_client", "unauthorized_client", "deleted_client"):
+        return "client"
+    return "unreachable"
 
 
 def grant(step, resource, role, member, token, until):

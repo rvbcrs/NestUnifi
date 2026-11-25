@@ -54,6 +54,9 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ steps.version.outputs.date }}
+          build-args: |
+            NESTUNIFI_VERSION=${{ steps.version.outputs.date }}
+            NESTUNIFI_REPOSITORY=${{ github.repository_owner }}/nestunifi
           labels: org.opencontainers.image.source=${{ env.SOURCE }}
           annotations: |
             index,manifest:org.opencontainers.image.source=${{ env.SOURCE }}

@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import secrets
 import socket
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +32,11 @@ KEY_FILE = "pubsub-sa.json"
 SETUP = PRIVATE / "admin/setup.json"
 AUTH = PRIVATE / "admin/auth.json"
 attempts = {"failed": 0, "until": 0.0}
+link_check = {"until": 0.0, "value": None}
+VERSION = os.environ.get("NESTUNIFI_VERSION", "dev")
+REPOSITORY = os.environ.get("NESTUNIFI_REPOSITORY", "")
+RELEASE = re.compile(r"\d{4}\.\d{2}\.\d{2}")
+update_check = {"until": 0.0, "value": None}
 ONVIF = PRIVATE / "onvif/config.yaml"
 MEDIA = PRIVATE / "media/mediamtx.yml"
 PENDING = PRIVATE / "admin/pending.json"
@@ -37,7 +44,16 @@ STATE = Path("/run/suite-status.json")
 CONTROL = Path("/run/control/control.sock")
 ORIGIN = "nestunifi:"
 MAX_NAME = 48
+MAX_REQUEST = 256 * 1024  # A backup is the largest request.
 FAMILIES = {"CAMERA": "Nest Cam", "DOORBELL": "Nest Doorbell", "DISPLAY": "Nest Hub"}
+# What a restored configuration keeps of the backup.
+GOOGLE_KEYS = {"client_id", "client_secret", "project_id", "redirect_uri", "pubsub_subscription", "service_account_key"}
+DEVICE_KEYS = {"name", "display_name", "kind", "uuid", "mac", "serial", "ports", "info", "auth", "streams"}
+# Each file in a backup, with the user the services read it as.
+BACKUP = {"bridge/config.yaml": (BRIDGE, 10001), "bridge/tokens.json": (TOKENS, 10001),
+          "bridge/" + KEY_FILE: (BRIDGE.parent / KEY_FILE, 10001), "media/mediamtx.yml": (MEDIA, 10002),
+          "onvif/config.yaml": (ONVIF, 0), "onvif/addresses.json": (ONVIF.parent / "addresses.json", 0),
+          "admin/setup.json": (SETUP, 0)}
 
 
 class Problem(Exception):
@@ -181,9 +197,71 @@ def source_live(cam):
     return {200: True, 404: False}.get(code)
 
 
+def motion(address):
+    """What the camera itself knows about the latest motion the bridge forwarded. None without events."""
+    if not address:
+        return None
+    conn = http.client.HTTPConnection(address, 80, timeout=0.5)
+    try:
+        conn.request("GET", "/trigger/motion")
+        response = conn.getresponse()
+        answer = json.loads(response.read(512)) if response.status == 200 else None
+        return answer if isinstance(answer, dict) else None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    finally:
+        conn.close()
+
+
+def google_link():
+    """Whether Google still accepts the stored link. Asked at most every ten minutes, a failure after one."""
+    if not TOKENS.exists():
+        return None
+    if time.monotonic() < link_check["until"]:
+        return link_check["value"]
+    google = read(BRIDGE)["google"]
+    value = google_api.check(google["client_id"], google["client_secret"], read(TOKENS).get("refresh_token", ""))
+    link_check.update(until=time.monotonic() + (600 if value == "ok" else 60), value=value)
+    return value
+
+
+def published_versions():
+    """The date tags in the image registry. Works without an account once the image is public."""
+    base = "https://ghcr.io/v2/" + REPOSITORY
+    with urllib.request.urlopen("https://ghcr.io/token?scope=repository:" + REPOSITORY + ":pull", timeout=8) as r:
+        token = json.load(r)["token"]
+    tags, url = [], base + "/tags/list?n=1000"
+    for _ in range(20):  # ponytail: 20,000 tags, decades of daily releases
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"Authorization": "Bearer " + token}), timeout=8) as r:
+            tags += json.load(r).get("tags") or []
+            follow = re.match(r"<(/v2/[^>]+)>;\s*rel=\"next\"", r.headers.get("Link", ""))
+        if not follow:
+            break
+        url = "https://ghcr.io" + follow[1]
+    return [t for t in tags if RELEASE.fullmatch(t)]
+
+
+def newer_version():
+    """The newest published version when it is newer than this one. Asked once a day."""
+    if not RELEASE.fullmatch(VERSION) or not REPOSITORY:
+        return None
+    if time.monotonic() < update_check["until"]:
+        return update_check["value"]
+    try:
+        newest = max(published_versions(), default=VERSION)
+        update_check.update(until=time.monotonic() + 86400, value=newest if newest > VERSION else None)
+    except (OSError, ValueError, KeyError, TypeError):
+        update_check["until"] = time.monotonic() + 3600
+    return update_check["value"]
+
+
 def status():
     onvif = read(ONVIF)
     state = read(STATE)
+    bridge = read(BRIDGE)
+    # The same addresses the supervisor gives each camera for the motion the bridge forwards.
+    motion_ips = {c["onvif"]["mac"].lower(): c["onvif"]["ip"] for c in bridge["cameras"]
+                  if bridge.get("events", {}).get("onvif") and c.get("event") is not None and c["onvif"].get("mac")}
     def summary(cam):
         current = state["cameras"].get(cam["uuid"], {})
         addr = current.get("ip", "")
@@ -192,10 +270,13 @@ def status():
         return {"id": cam["uuid"], "name": display(cam), "ip": addr, "online": healthy,
                 "username": cam["auth"]["username"], "kind": cam.get("kind", kind_from_name(cam["name"])),
                 "model": cam["info"]["model"], "live": source_live(cam) if state["media"] else None,
-                "width": profile["width"], "height": profile["height"]}
+                "width": profile["width"], "height": profile["height"],
+                "motion": motion(motion_ips.get(cam["mac"].lower()))}
     with ThreadPoolExecutor(max_workers=6) as pool:
+        link, update = pool.submit(google_link), pool.submit(newer_version)
         cams = sorted(pool.map(summary, onvif["devices"]), key=lambda c: c["name"].casefold())
-    return {"cameras": cams, "bridge": state["bridge"]}
+    return {"cameras": cams, "bridge": state["bridge"], "google": link.result(),
+            "version": VERSION, "update": update.result()}
 
 
 
@@ -282,6 +363,23 @@ def add_configs(bridge, onvif, media, dev, label, password):
     return cam
 
 
+def remove_configs(bridge, onvif, media, cam):
+    """Take one camera out of all three files. A reader left without streams goes too; publishers stay for the next camera."""
+    path = stream_path(cam)
+    # The bridge publishes each camera to the path it derives from its name.
+    entries = [c for c in bridge["cameras"] if "cam-" + slug(c["name"]) == path]
+    if len(entries) != 1:
+        raise Problem("De videobridge-instelling van deze camera is niet eenduidig.")
+    bridge["cameras"].remove(entries[0])
+    onvif["devices"].remove(cam)
+    media["paths"].pop(path, None)
+    for user in list(media["authInternalUsers"]):
+        reader = {"action": "read", "path": path} in user["permissions"]
+        user["permissions"] = [rule for rule in user["permissions"] if rule.get("path") != path]
+        if reader and not user["permissions"]:
+            media["authInternalUsers"].remove(user)
+
+
 def ready(cam=None):
     revision = hashlib.sha256(ONVIF.read_bytes()).hexdigest()
     for _ in range(60):
@@ -300,8 +398,12 @@ def recover():
     if job["action"] == "password":
         time.sleep(1.2)  # MediaMTX coalesces configuration events within one second.
     for path, data in job["before"].items():
-        replace(Path(path), data)
-    cam = None if job["action"] == "add" else camera(read(ONVIF), job["camera"]["uuid"])
+        if data is None:
+            Path(path).unlink(missing_ok=True)
+        else:
+            replace(Path(path), data)
+    # A restored camera may have been offline before; waiting for it would keep every request failing.
+    cam = None if job["action"] in ("add", "remove", "restore") else camera(read(ONVIF), job["camera"]["uuid"])
     ready(cam)
     if job["action"] == "password":
         confirm_reader(cam, job["camera"]["auth"]["password"])
@@ -339,6 +441,12 @@ def change(action, req):
         if req.get("previous") != display(cam):
             raise Problem("De naam is intussen gewijzigd. Vernieuw het overzicht.")
         cam["display_name"] = label
+    elif action == "remove":
+        cam = camera(onvif, req.get("id"))
+        label = display(cam)
+        bridge, media = read(BRIDGE), read(MEDIA)
+        before.update({str(BRIDGE): copy.deepcopy(bridge), str(MEDIA): copy.deepcopy(media)})
+        remove_configs(bridge, onvif, media, cam)
     else:
         label = name_input(req.get("name"))
         bridge, media = read(BRIDGE), read(MEDIA)
@@ -355,12 +463,12 @@ def change(action, req):
         raise Problem("Er is al een camera met deze naam.")
     replace(PENDING, {"action": action, "camera": cam, "before": before})
     try:
-        if action == "add":
+        if action in ("add", "remove"):
             replace(BRIDGE, bridge)
-        if action in ("add", "password"):
+        if action in ("add", "password", "remove"):
             replace(MEDIA, media)
         replace(ONVIF, onvif)
-        ready(cam)
+        ready(None if action == "remove" else cam)
         if action == "password":
             confirm_reader(cam, former)
         if action == "add":
@@ -374,7 +482,7 @@ def change(action, req):
     except Exception:
         recover()
         raise
-    return {"name": label}
+    return {"name": label, "removed": True} if action == "remove" else {"name": label}
 
 
 def test_stream(req):
@@ -477,6 +585,7 @@ def setup(action, req):
             raise Problem("Het clientgeheim is onvolledig. Kopieer het opnieuw uit Google Cloud.")
         google.update(client_id=client_id, client_secret=secret, redirect_uri=redirect_for(origin))
         replace(BRIDGE, bridge)
+        link_check["until"] = 0.0
     elif action == "project":
         project = str(req.get("project") or "").strip().lower()
         if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", project):
@@ -519,6 +628,9 @@ def setup(action, req):
                 expiry = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + int(token.get("expires_in", 0))))
                 replace(TOKENS, {"access_token": token["access_token"], "token_type": "Bearer",
                                  "refresh_token": token["refresh_token"], "expiry": expiry}, 10001)
+                # The bridge reads the token file only when it starts. A rewritten configuration restarts it.
+                replace(BRIDGE, bridge)
+                link_check["until"] = 0.0
                 try:
                     inventory()  # Google completes the link, and starts events, on the first device listing.
                 except subprocess.SubprocessError:
@@ -528,6 +640,76 @@ def setup(action, req):
         except ValueError:
             raise Problem("De camera-instellingen passen niet meer bij elkaar. Meldingen zijn niet ingeschakeld.")
     return setup_state(origin)
+
+
+def backup():
+    """Everything needed to move to another system, Google link included. The admin password stays behind."""
+    return {"nestunifi": 1, "version": VERSION,
+            "files": {name: read(path) for name, (path, _) in BACKUP.items() if path.exists()}}
+
+
+def restored(files):
+    """The three configuration files of a backup, rebuilt from the fields NestUnifi writes itself. Anything else in
+    the file, such as a media server hook that runs a command, stays out. A malformed file raises."""
+    bridge, media, onvif = files["bridge/config.yaml"], files["media/mediamtx.yml"], files["onvif/config.yaml"]
+    google = {k: v for k, v in bridge["google"].items() if k in GOOGLE_KEYS}
+    base = urlsplit(bridge["media"]["rtsp_base_url"])
+    cameras = [dict({"device_id": c["device_id"], "name": c["name"], "audio": bool(c.get("audio")),
+                     "onvif": {"ip": c["onvif"]["ip"], "mac": c["onvif"]["mac"]}},
+                    **({"event": {"linger": c["event"].get("linger", "60s")}} if c.get("event") is not None else {}))
+               for c in bridge["cameras"]]
+    users = [dict({"user": u["user"], "pass": u["pass"],
+                   "permissions": [{"action": r["action"], "path": r["path"]} for r in u["permissions"]]},
+                  **({"ips": list(u["ips"])} if "ips" in u else {}))
+             for u in media["authInternalUsers"]]
+    paths = {path: {} for path in media["paths"]}
+    devices = [{k: v for k, v in c.items() if k in DEVICE_KEYS} for c in onvif["devices"]]
+    text = lambda *values: all(isinstance(v, str) for v in values)
+    published = {"cam-" + slug(c["name"]) for c in cameras}
+    if (not text(*google.values()) or google.get("service_account_key", KEY_FILE) != KEY_FILE
+            or (base.scheme, base.hostname, base.port) != ("rtsp", "127.0.0.1", 8554)
+            or not all(text(c["device_id"], c["name"], c["onvif"]["mac"], c.get("event", {}).get("linger", ""))
+                       and re.fullmatch(r"127\.0\.0\.\d{1,3}", c["onvif"]["ip"]) for c in cameras)
+            or not all(text(u["user"], u["pass"], *u.get("ips", [])) and all(r["action"] in ("read", "publish") and text(r["path"])
+                                                         for r in u["permissions"]) for u in users)
+            or not all(re.fullmatch(r"cam-[a-z0-9-]+", path) for path in paths)
+            or {stream_path(c) for c in devices} != published or not published <= paths.keys()):
+        raise TypeError
+    return (dict(read(BRIDGE), google=google, media={"rtsp_base_url": base.geturl()}, cameras=cameras,
+                 events={"onvif": bool(bridge.get("events", {}).get("onvif"))}),
+            dict(read(MEDIA), authInternalUsers=users, paths=paths), {"devices": devices})
+
+
+def restore(req):
+    """Put a backup on an installation that has no cameras yet."""
+    data = req.get("backup")
+    files = data.get("files") if isinstance(data, dict) and data.get("nestunifi") == 1 else None
+    required = {"bridge/config.yaml", "media/mediamtx.yml", "onvif/config.yaml"}
+    if not isinstance(files, dict) or not required <= files.keys() <= BACKUP.keys():
+        raise Problem("Dit bestand is geen back-up van NestUnifi.")
+    if read(BRIDGE)["cameras"] or read(ONVIF)["devices"]:
+        raise Problem("Terugzetten kan alleen op een installatie zonder camera's.")
+    try:
+        if not all(isinstance(f, dict) for f in files.values()):
+            raise TypeError
+        files = dict(files, **dict(zip(("bridge/config.yaml", "media/mediamtx.yml", "onvif/config.yaml"), restored(files))))
+    except (KeyError, TypeError, AttributeError, ValueError, Problem):
+        raise Problem("Deze back-up is onvolledig of beschadigd.")
+    replace(PENDING, {"action": "restore", "camera": None,
+                      "before": {str(path): read(path) if path.exists() else None for path, _ in BACKUP.values()}})
+    try:
+        for name, (path, uid) in BACKUP.items():
+            if name in files:
+                replace(path, files[name], uid)
+            else:
+                path.unlink(missing_ok=True)
+        ready()
+        PENDING.unlink()
+    except Exception:
+        recover()
+        raise
+    link_check["until"] = 0.0
+    return setup_state(req.get("origin") or "")
 
 
 def password_hash(password, salt):
@@ -583,10 +765,14 @@ def dispatch(req):
             raise Problem("De bridge ontvangt geen video van " + display(cam) +
                           ". Controleer het livebeeld in Google Home en probeer het opnieuw.")
         return {"url": "/live/" + stream_path(cam) + "/index.m3u8"}
-    if action in ("add", "rename", "profile", "password"):
+    if action in ("add", "rename", "profile", "password", "remove"):
         return change(action, req)
     if action in ("setup", "client", "project", "consent", "code"):
         return setup(action, req)
+    if action == "backup":
+        return backup()
+    if action == "restore":
+        return restore(req)
     raise Problem("Onbekende actie.")
 
 
@@ -594,8 +780,8 @@ class Request(socketserver.StreamRequestHandler):
     def handle(self):
         try:
             self.request.settimeout(8)
-            line = self.rfile.readline(8193)
-            if len(line) > 8192:
+            line = self.rfile.readline(MAX_REQUEST + 1)
+            if len(line) > MAX_REQUEST:
                 raise Problem("Verzoek is te groot.")
             with (PENDING.parent / "admin.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)

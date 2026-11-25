@@ -19,8 +19,8 @@ MEDIA = "http://127.0.0.1:8888/"
 MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
-ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "view",
-           "setup", "client", "project", "consent", "code", "auth", "claim", "login", "logout"}
+ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "view",
+           "setup", "client", "project", "consent", "code", "backup", "restore", "auth", "claim", "login", "logout"}
 # Everything else needs a session. A session starts when the worker accepts the admin password.
 OPEN = {"auth", "claim", "login", "logout"}
 SESSIONS = {}
@@ -124,7 +124,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(403, {"error": "Ongeldige herkomst."})
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size <= 4096:
+            if not 0 < size <= (200 * 1024 if self.path == "/api/restore" else 4096):
                 return self.reply(400, {})
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):

@@ -22,6 +22,10 @@ COPY suite/upstream/LICENSE /usr/share/licenses/onvif-proxy/LICENSE
 COPY --from=build /out/mediamtx-LICENSE /usr/share/licenses/mediamtx/LICENSE
 LABEL org.opencontainers.image.title="NestUnifi" \
       org.opencontainers.image.description="Google Nest cameras, doorbells and hubs as ONVIF cameras for UniFi Protect"
+# The published version and where newer ones appear. A local build is "dev" and never looks for updates.
+ARG NESTUNIFI_VERSION=dev
+ARG NESTUNIFI_REPOSITORY=
+ENV NESTUNIFI_VERSION=$NESTUNIFI_VERSION NESTUNIFI_REPOSITORY=$NESTUNIFI_REPOSITORY
 WORKDIR /state
 ENTRYPOINT ["python3", "-IB", "/app/runtime.py"]
 CMD []

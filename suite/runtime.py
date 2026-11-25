@@ -11,6 +11,8 @@ from pathlib import Path
 
 APP = Path("/app")
 SOURCE = Path("private/onvif/config.yaml")
+# The last address each camera had. After a restart it asks the router for the same one, so Protect finds it again.
+ADDRESSES = Path("private/onvif/addresses.json")
 BRIDGE = Path("/config/config.yaml")
 TOKENS = Path("/config/tokens.json")
 MEDIA = Path("/media-config/mediamtx.yml")
@@ -84,6 +86,20 @@ def discovery_socket(interface, address):
         raise
 
 
+def remembered():
+    try:
+        known = json.loads(ADDRESSES.read_text())
+        return known if isinstance(known, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remember(mac, address):
+    known = remembered()
+    if known.get(mac) != address:
+        atomic(ADDRESSES, json.dumps(dict(known, **{mac: address})))
+
+
 def device_config(cam):
     device = cam.copy()
     device.pop("kind", None)
@@ -120,11 +136,16 @@ class Endpoint:
         if not (Path("/sys/class/net") / self.dev).exists():
             ip("link", "add", "link", self.lan, "name", self.dev, "address", self.cam["mac"], "type", "macvlan", "mode", "bridge")
             ip("link", "set", self.dev, "up")
+        mac = self.cam["mac"].lower()
         if self.dhcp is None or self.dhcp.poll() is not None:
+            known = remembered().get(mac)
+            request = ["-r", known] if isinstance(known, str) and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", known) else []
             self.dhcp = subprocess.Popen(["udhcpc", "-f", "-i", self.dev, "-p", "/run/"+self.dev+".pid",
-                                          "-s", "/app/lease.py", "-x", "hostname:"+self.hostname],
+                                          "-s", "/app/lease.py", "-x", "hostname:"+self.hostname, *request],
                                          stdout=subprocess.DEVNULL)
         address = self.lease.read_text() if self.lease.exists() else ""
+        if address and address != self.address:
+            remember(mac, address)
         if address != self.address or self.server and self.server.poll() is not None:
             stop(self.server)
             self.server = None

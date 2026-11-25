@@ -2,8 +2,10 @@ package onvif
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -47,6 +49,21 @@ func TestMotionPullPoints(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go first.ServeTrigger(ctx, ln)
+	motion := func() (state struct{ Active bool; Last string }) {
+		t.Helper()
+		r, err := http.Get("http://" + ln.Addr().String() + "/trigger/motion")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	if state := motion(); state.Active || state.Last != "" {
+		t.Fatal("motion reported before any trigger", state)
+	}
 	for _, state := range []string{"on", "on", "off"} {
 		r, err := http.Post("http://"+ln.Addr().String()+"/trigger/motion?state="+state, "text/plain", nil)
 		if err != nil {
@@ -56,6 +73,9 @@ func TestMotionPullPoints(t *testing.T) {
 		if r.StatusCode != 200 {
 			t.Fatal(r.Status)
 		}
+	}
+	if state := motion(); state.Active || state.Last == "" {
+		t.Fatal("last motion not recorded", state)
 	}
 	for _, expected := range []string{"true", "false"} {
 		response := eventCall(first, points[0], pull)
@@ -79,5 +99,10 @@ func TestMotionPullPoints(t *testing.T) {
 	}
 	if r := post(t, first, "/trigger/motion?state=on", ""); r.Code != 404 {
 		t.Fatal("trigger reachable over camera's public router")
+	}
+	public := httptest.NewRecorder()
+	first.mux.ServeHTTP(public, httptest.NewRequest("GET", "/trigger/motion", nil))
+	if public.Code != 404 {
+		t.Fatal("motion state reachable over camera's public router")
 	}
 }

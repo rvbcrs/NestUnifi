@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -82,6 +83,7 @@ func (p *pullPoint) enqueue(active bool, at time.Time, operation string) {
 type eventState struct {
 	mu      sync.Mutex
 	active  bool
+	since   time.Time // start of the latest motion, for the admin page
 	points  map[string]*pullPoint
 	changed chan struct{}
 }
@@ -106,6 +108,9 @@ func (s *Server) ServeTrigger(ctx context.Context, ln net.Listener) error {
 		if e.active != active {
 			e.active = active
 			now := time.Now()
+			if active {
+				e.since = now
+			}
 			for _, p := range e.points {
 				if now.Before(p.expires) {
 					p.enqueue(active, now, "Changed")
@@ -114,6 +119,21 @@ func (s *Server) ServeTrigger(ctx context.Context, ln net.Listener) error {
 			e.wake()
 		}
 		w.WriteHeader(http.StatusOK)
+	})
+	// Only processes inside the container reach this loopback listener. The admin page reads it.
+	mux.HandleFunc("GET /trigger/motion", func(w http.ResponseWriter, r *http.Request) {
+		e := &s.events
+		e.mu.Lock()
+		state := struct {
+			Active bool   `json:"active"`
+			Last   string `json:"last"`
+		}{Active: e.active}
+		if !e.since.IsZero() {
+			state.Last = stamp(e.since)
+		}
+		e.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(state)
 	})
 	srv := s.httpServer()
 	srv.Handler = mux
