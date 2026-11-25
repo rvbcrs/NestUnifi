@@ -1,0 +1,14 @@
+[Unit]
+Description=Physical LAN for the NestUnifi suite
+After=container-studio-engine.service network-online.target
+BindsTo=container-studio-engine.service
+PartOf=container-studio-engine.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nestunifi-discovery/prepare-lan.sh
+TimeoutStartSec=180
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target container-studio-engine.service

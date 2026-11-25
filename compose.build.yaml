@@ -1,0 +1,6 @@
+# Build NestUnifi from the source in this folder instead of downloading the published image:
+#   docker compose -f compose.yaml -f compose.build.yaml up -d --build
+services:
+  suite:
+    image: nestunifi:local
+    build: .

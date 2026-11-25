@@ -1,0 +1,40 @@
+--- a/cmd/onvif-proxy/main.go
++++ b/cmd/onvif-proxy/main.go
+@@ -216,7 +216,7 @@
+ 		cache := mediautil.NewCache(time.Duration(dev.SnapshotCacheSeconds()) * time.Second)
+ 		gen.caches[dev.UUID] = cache
+ 
+-		soapLn, err := lc.Listen(genCtx, "tcp4", ":"+strconv.Itoa(dev.Ports.SOAP))
++		soapLn, err := lc.Listen(genCtx, "tcp4", advertiseIP+":"+strconv.Itoa(dev.Ports.SOAP))
+ 		if err != nil {
+ 			gen.closePrepared()
+ 			return nil, fmt.Errorf("device %q SOAP port %d: %w", dev.Name, dev.Ports.SOAP, err)
+@@ -239,7 +239,7 @@
+ 
+ 		for _, b := range dev.ProxyBindings() {
+ 			b := b
+-			rtspLn, err := lc.Listen(genCtx, "tcp4", ":"+strconv.Itoa(b.ListenPort))
++			rtspLn, err := lc.Listen(genCtx, "tcp4", advertiseIP+":"+strconv.Itoa(b.ListenPort))
+ 			if err != nil {
+ 				gen.closePrepared()
+ 				return nil, fmt.Errorf("device %q RTSP port %d: %w", dev.Name, b.ListenPort, err)
+@@ -313,10 +313,18 @@
+ }
+ 
+ func prepareDiscovery(devices []discovery.Device) (*preparedDiscovery, error) {
+-	conn, addr, err := discovery.Listen()
++	fd, err := strconv.Atoi(os.Getenv("DISCOVERY_FD"))
++	if err != nil || fd < 3 {
++		return nil, fmt.Errorf("camera discovery socket is missing")
++	}
++	file := os.NewFile(uintptr(fd), "discovery")
++	packet, err := net.FilePacketConn(file)
++	file.Close()
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	conn := packet.(*net.UDPConn)
++	addr := &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 3702}
+ 	return &preparedDiscovery{server: discovery.New(devices), conn: conn, addr: addr}, nil
+ }
+ 

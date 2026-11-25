@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="nl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#111023" />
+    <title>NestUnifi · Camerabeheer</title>
+    <link rel="icon" href="/assets/aperture.svg" />
+    <link rel="stylesheet" href="/app.css" />
+    <script defer src="/assets/hls.light.min.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="bar">
+        <a class="brand" href="/" aria-label="NestUnifi start"
+          ><span class="brand-mark"
+            ><img src="/assets/aperture.svg" alt="" /></span
+          >Nest<span class="brand-tail">Unifi</span></a
+        >
+        <div class="toolbar">
+          <span id="bridge" class="pill" hidden></span>
+          <button
+            class="quiet icon-button"
+            id="openSetup"
+            title="Installatie en Google-koppeling"
+            aria-label="Installatie en Google-koppeling"
+            hidden
+          >
+            <img src="/assets/gear-six.svg" alt="" />
+          </button>
+        </div>
+      </div>
+    </header>
+    <main>
+      <section id="setup" hidden>
+        <div class="section-head">
+          <div>
+            <h1>NestUnifi instellen</h1>
+            <p class="overview-status">
+              Vijf stappen, eenmalig. Wat automatisch kan, doet NestUnifi zelf.
+            </p>
+          </div>
+          <button class="quiet" id="setupClose" hidden>Naar het overzicht</button>
+        </div>
+        <ol id="steps" class="steps"></ol>
+      </section>
+      <section id="overview">
+        <div class="section-head">
+          <div>
+            <h1>Cameraoverzicht</h1>
+            <p class="overview-status" id="overviewStatus" hidden><span id="summary"></span> · <span id="endpoints"></span></p>
+          </div>
+          <div class="toolbar">
+            <button
+              class="quiet icon-button"
+              id="refresh"
+              title="Overzicht vernieuwen"
+              aria-label="Overzicht vernieuwen"
+            >
+              <img src="/assets/arrows-clockwise.svg" alt="" /></button
+            ><button class="primary" id="find">
+              <img src="/assets/plus.svg" alt="" />Apparaat toevoegen
+            </button>
+          </div>
+        </div>
+        <div
+          id="filters"
+          class="filters"
+          role="group"
+          aria-label="Filter op apparaattype"
+        ></div>
+        <p class="message notice" id="notice" role="status">Apparaten laden…</p>
+        <div id="devices"></div>
+      </section>
+    </main>
+    <dialog id="modal" aria-labelledby="modalTitle">
+      <form id="dialogForm">
+        <div class="modal-head">
+          <h2 id="modalTitle"></h2>
+          <button
+            type="button"
+            class="close icon-button"
+            aria-label="Sluiten"
+            id="close"
+          >
+            <img src="/assets/x.svg" alt="" />
+          </button>
+        </div>
+        <div id="fields"></div>
+        <p id="modalMessage" class="message" role="status"></p>
+        <div class="actions">
+          <button class="quiet" id="cancel" type="button">Sluiten</button
+          ><button class="primary" id="submit" hidden>Opslaan</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

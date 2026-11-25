@@ -1,0 +1,75 @@
+--- a/internal/onvif/server.go
++++ b/internal/onvif/server.go
+@@ -1,7 +1,7 @@
+ // Package onvif implements the ONVIF Device and Media services for a single
+ // virtual device. Each device runs one http.Server bound to dev.Ports.SOAP
+ // and serves POST /onvif/device_service, POST /onvif/media_service and an
+-// GET /onvif/snapshot (HTTP Basic when device auth is configured). Responses
++// GET /onvif/snapshot (HTTP Digest or Basic when device auth is configured). Responses
+ // are hand-written XML templates matching the ONVIF WSDL element definitions;
+ // every dynamic value is XML-escaped. Method coverage follows docs/02 sections
+ // 4 and 5.
+@@ -56,6 +56,7 @@
+ 	nonceMu    sync.Mutex
+ 	usedNonces map[[32]byte]time.Time
+ 	events     eventState
++	digest     snapshotDigest
+ }
+ 
+ // NewServer builds a Server and its route table for dev.
+@@ -221,10 +222,11 @@
+ // ---- snapshot -------------------------------------------------------------
+ 
+ // handleSnapshot serves GET /onvif/snapshot?token=<profileToken>. When ONVIF
+-// auth is configured it requires the same credentials via HTTP Basic.
++// auth is configured it requires the same credentials via HTTP Digest or Basic.
+ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+-	if s.dev.Auth != nil && !s.snapshotAuthorized(r) {
+-		w.Header().Set("WWW-Authenticate", `Basic realm="ONVIF Snapshot"`)
++	if auth := s.dev.Auth; auth != nil && !s.snapshotAuthorized(r) && !s.digest.verify(r, auth.Username, auth.Password) {
++		w.Header().Add("WWW-Authenticate", s.digest.challenge().String())
++		w.Header().Add("WWW-Authenticate", `Basic realm="ONVIF Snapshot"`)
+ 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+ 		return
+ 	}
+@@ -240,7 +242,7 @@
+ 	}
+ 	data, contentType, err := s.opts.SnapshotFunc(r.Context(), stream.Name)
+ 	if err != nil {
+-		http.Error(w, "snapshot failed: "+err.Error(), http.StatusBadGateway)
++		http.Error(w, "snapshot source unavailable", http.StatusBadGateway)
+ 		return
+ 	}
+ 	if contentType == "" {
+--- a/internal/onvif/onvif_test.go
++++ b/internal/onvif/onvif_test.go
+@@ -273,7 +273,7 @@
+ 	if snapRec.Code != 401 {
+ 		t.Fatalf("unauthenticated snapshot status = %d, want 401", snapRec.Code)
+ 	}
+-	if got := snapRec.Header().Get("WWW-Authenticate"); !strings.HasPrefix(got, "Basic ") {
++	if got := strings.Join(snapRec.Header().Values("WWW-Authenticate"), ", "); !strings.Contains(got, "Basic ") {
+ 		t.Errorf("WWW-Authenticate = %q, want Basic challenge", got)
+ 	}
+ 
+--- a/go.mod
++++ b/go.mod
+@@ -5,6 +5,7 @@
+ require gopkg.in/yaml.v3 v3.0.1
+ 
+ require (
++	github.com/icholy/digest v1.2.0
+ 	golang.org/x/sync v0.22.0 // indirect
+ 	golang.org/x/time v0.15.0 // indirect
+ )
+--- a/go.sum
++++ b/go.sum
+@@ -4,6 +4,8 @@
+ github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+ github.com/google/jsonschema-go v0.4.3 h1:/DBOLZTfDow7pe2GmaJNhltueGTtDKICi8V8p+DQPd0=
+ github.com/google/jsonschema-go v0.4.3/go.mod h1:r5quNTdLOYEz95Ru18zA0ydNbBuYoo9tgaYcxEYhJVE=
++github.com/icholy/digest v1.2.0 h1:oTbG4IsNOmidJ+421ehG7Ty93yt1yotq13kFMG569yw=
++github.com/icholy/digest v1.2.0/go.mod h1:1P1+LzUv48ybX7bu8tVpZ2QWdd+xRuePNuGawHjwRUE=
+ github.com/modelcontextprotocol/go-sdk v1.7.0 h1:yqjY2dsbKAC0LSuWZVBMrHgiG8ukXv6NRo0JiALay44=
+ github.com/modelcontextprotocol/go-sdk v1.7.0/go.mod h1:dL7u98E/zjJTGzEq+j30jQ8K2k1mb6LeAH4inEcSGts=
+ github.com/segmentio/asm v1.2.1 h1:DTNbBqs57ioxAD4PrArqftgypG4/qNpXoJx8TVXxPR0=

@@ -1,0 +1,132 @@
+--- a/internal/soap/soap.go
++++ b/internal/soap/soap.go
+@@ -35,6 +35,7 @@
+ // namespace URI, Body is the raw innerxml of the Body (for parameter
+ // extraction) and Security is the WSSE UsernameToken when present.
+ type Request struct {
++	MessageID string
+ 	Action    string
+ 	Namespace string
+ 	Body      []byte
+@@ -54,7 +55,8 @@
+ // local name, so any namespace prefix on the wire is accepted.
+ type wire struct {
+ 	Header struct {
+-		Security struct {
++		MessageID string `xml:"MessageID"`
++		Security  struct {
+ 			UsernameToken *struct {
+ 				Username string `xml:"Username"`
+ 				Password struct {
+@@ -79,7 +81,7 @@
+ 		return nil, fmt.Errorf("soap: parse envelope: %w", err)
+ 	}
+ 
+-	req := &Request{Body: w.Body.Inner}
++	req := &Request{Body: w.Body.Inner, MessageID: w.Header.MessageID}
+ 	// The Body innerxml alone loses the namespace declarations inherited from
+ 	// the Envelope, so resolve the action element over the full document where
+ 	// the decoder can bind prefixes to their namespace URIs.
+--- a/internal/onvif/server.go
++++ b/internal/onvif/server.go
+@@ -55,18 +55,21 @@
+ 	mux        *http.ServeMux
+ 	nonceMu    sync.Mutex
+ 	usedNonces map[[32]byte]time.Time
++	events     eventState
+ }
+ 
+ // NewServer builds a Server and its route table for dev.
+ func NewServer(dev *config.Device, opts Options) *Server {
+ 	s := &Server{
+ 		dev:        dev,
++		events:     eventState{points: make(map[string]*pullPoint), changed: make(chan struct{})},
+ 		opts:       opts,
+ 		mux:        http.NewServeMux(),
+ 		usedNonces: make(map[[32]byte]time.Time),
+ 	}
+ 	s.mux.HandleFunc("POST /onvif/device_service", s.handleDevice)
+ 	s.mux.HandleFunc("POST /onvif/media_service", s.handleMedia)
++	s.mux.HandleFunc("POST /onvif/events_service", s.handleEvents)
+ 	s.mux.HandleFunc("GET /onvif/snapshot", s.handleSnapshot)
+ 	return s
+ }
+--- a/internal/onvif/device.go
++++ b/internal/onvif/device.go
+@@ -85,6 +85,7 @@
+ 		"<tt:System><tt:DiscoveryResolve>false</tt:DiscoveryResolve><tt:DiscoveryBye>true</tt:DiscoveryBye><tt:RemoteDiscovery>false</tt:RemoteDiscovery><tt:SystemBackup>false</tt:SystemBackup><tt:SystemLogging>false</tt:SystemLogging><tt:FirmwareUpgrade>false</tt:FirmwareUpgrade></tt:System>" +
+ 		"<tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration><tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security>" +
+ 		"</tt:Device>" +
++		"<tt:Events><tt:XAddr>" + soap.XMLEscape("http://"+s.hostPort(r)+"/onvif/events_service") + "</tt:XAddr><tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport><tt:WSPullPointSupport>true</tt:WSPullPointSupport><tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport></tt:Events>" +
+ 		"<tt:Media>" +
+ 		"<tt:XAddr>" + mediaXAddr + "</tt:XAddr>" +
+ 		"<tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities>" +
+@@ -106,7 +107,11 @@
+ 			"<tds:Namespace>" + ns + "</tds:Namespace>" +
+ 			"<tds:XAddr>" + soap.XMLEscape("http://"+s.hostPort(r)+path) + "</tds:XAddr>"
+ 		if includeCap {
+-			out += "<tds:Capabilities></tds:Capabilities>"
++			if ns == eventNS {
++				out += `<tds:Capabilities xmlns:tev="` + eventNS + `">` + eventCaps + "</tds:Capabilities>"
++			} else {
++				out += "<tds:Capabilities></tds:Capabilities>"
++			}
+ 		}
+ 		out += "<tds:Version><tt:Major>2</tt:Major><tt:Minor>60</tt:Minor></tds:Version>" +
+ 			"</tds:Service>"
+@@ -115,6 +120,7 @@
+ 	return "<tds:GetServicesResponse>" +
+ 		entry(soap.NSDevice, "/onvif/device_service") +
+ 		entry(soap.NSMedia, "/onvif/media_service") +
++		entry(eventNS, "/onvif/events_service") +
+ 		"</tds:GetServicesResponse>"
+ }
+ 
+--- a/cmd/onvif-proxy/main.go
++++ b/cmd/onvif-proxy/main.go
+@@ -236,6 +236,21 @@
+ 				return srv.Serve(ctx, soapLn)
+ 			},
+ 		})
++
++		if ip := os.Getenv("NEST_MOTION_IP"); ip != "" {
++			addr := net.ParseIP(ip)
++			if addr == nil || addr.To4() == nil || !addr.IsLoopback() {
++				gen.closePrepared()
++				return nil, fmt.Errorf("motion input requires an IPv4 loopback address")
++			}
++			trigger, err := lc.Listen(genCtx, "tcp4", net.JoinHostPort(ip, "80"))
++			if err != nil {
++				gen.closePrepared()
++				return nil, fmt.Errorf("listen for motion on %s: %w", ip, err)
++			}
++			gen.tasks = append(gen.tasks, generationTask{label: "motion input", state: state, ln: trigger,
++				run: func(ctx context.Context) error { return srv.ServeTrigger(ctx, trigger) }})
++		}
+ 
+ 		for _, b := range dev.ProxyBindings() {
+ 			b := b
+--- a/internal/discovery/messages.go
++++ b/internal/discovery/messages.go
+@@ -106,7 +106,7 @@
+ 		`<d:Types>` + deviceTypes + `</d:Types>` +
+ 		`<d:Scopes>` + esc(scopesFor(d)) + `</d:Scopes>` +
+ 		`<d:XAddrs>` + esc(d.XAddr) + `</d:XAddrs>` +
+-		`<d:MetadataVersion>1</d:MetadataVersion>`
++		`<d:MetadataVersion>2</d:MetadataVersion>`
+ }
+ 
+ // buildHello renders a Hello announcement, multicast on start / device add.
+--- a/internal/discovery/messages_test.go
++++ b/internal/discovery/messages_test.go
+@@ -52,8 +52,8 @@
+ 	if ep.XAddrs != d.XAddr {
+ 		t.Errorf("XAddrs = %q, want %q", ep.XAddrs, d.XAddr)
+ 	}
+-	if ep.MetadataVersion != "1" {
+-		t.Errorf("MetadataVersion = %q, want 1", ep.MetadataVersion)
++	if ep.MetadataVersion != "2" {
++		t.Errorf("MetadataVersion = %q, want 2", ep.MetadataVersion)
+ 	}
+ 	// Scopes: name/hardware are URL-escaped ("Front Door" -> "Front%20Door").
+ 	if !strings.Contains(ep.Scopes, "onvif://www.onvif.org/name/Front%20Door") {

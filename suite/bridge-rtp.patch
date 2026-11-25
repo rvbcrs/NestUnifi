@@ -1,0 +1,41 @@
+--- a/internal/media/publisher.go
++++ b/internal/media/publisher.go
+@@ -161,6 +161,13 @@
+ 	}
+ 	if pkt == nil {
+ 		return p.fail(errors.New("RTP packet is nil"))
++	}
++
++	// Payload type 0 is reserved for PCMU. Some Nest sessions interleave it
++	// with H.264 packets. It cannot describe or carry the negotiated video.
++	if info.Kind == webrtc.RTPCodecTypeVideo && pkt.PayloadType == 0 {
++		p.discarded.Add(1)
++		return nil
+ 	}
+ 
+ 	p.mu.Lock()
+--- a/internal/media/publisher_test.go
++++ b/internal/media/publisher_test.go
+@@ -435,6 +435,22 @@
+ func TestNewPublisherRejectsOpaqueURL(t *testing.T) {
+ 	_, err := media.NewPublisher(config.Camera{Name: "Backyard"}, "rtsp:opaque")
+ 	require.Error(t, err)
++}
++
++func TestPublisherIgnoresPCMUOnH264Track(t *testing.T) {
++	baseURL, _ := startTestRTSPServer(t)
++	p, err := media.NewPublisher(config.Camera{Name: "Hall"}, baseURL)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = p.Close() })
++
++	for seq, pt := range []uint8{0, 112, 0, 112} {
++		packet := &rtp.Packet{Header: rtp.Header{PayloadType: pt, SequenceNumber: uint16(seq)}, Payload: []byte{0x65}}
++		require.NoError(t, p.WriteRTP(videoTrack, packet))
++	}
++	stats := p.SinkStats()
++	assert.EqualValues(t, 2, stats.Published)
++	assert.EqualValues(t, 2, stats.Discarded)
++	assert.Zero(t, stats.Failed)
+ }
+ 
+ func TestPublisherRejectsPayloadTypeChange(t *testing.T) {

@@ -1,0 +1,52 @@
+name: nestunifi
+
+services:
+  suite:
+    image: ${NESTUNIFI_IMAGE:-ghcr.io/rvbcrs/nestunifi:latest}
+    container_name: nestunifi
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, CHOWN, DAC_OVERRIDE, KILL, FOWNER]
+    security_opt: [no-new-privileges:true]
+    environment:
+      NESTUNIFI_HOSTNAMES: ${NESTUNIFI_HOSTNAMES:-}
+    tmpfs:
+      - /run:rw,noexec,nosuid,nodev,mode=0755
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+    extra_hosts:
+      - "mediamtx:127.0.0.1"
+    # Two networks. The default one carries the admin page and the connection to Google.
+    # On the LAN one every camera gets its own MAC address and asks your router for an address.
+    networks: [default, lan]
+    # Several addresses on one LAN in one container: each answers only for itself.
+    sysctls:
+      net.ipv4.conf.default.arp_ignore: 1
+      net.ipv4.conf.all.arp_ignore: 1
+      net.ipv4.conf.all.arp_announce: 2
+      net.ipv4.conf.default.rp_filter: 0
+      net.ipv4.conf.all.rp_filter: 0
+    ports:
+      - "${NESTUNIFI_PORT:-8780}:8080/tcp"
+    volumes:
+      - ./private/bridge:/config
+      - ./private/media:/media-config
+      - ./private/onvif:/state/private/onvif
+      - ./private/admin:/state/private/admin
+    healthcheck:
+      test: ["CMD", "python3", "-Ic", "import json,os; s=json.load(open('/run/suite-status.json')); assert (s['bridge'] or s['idle']) and s['media'] and s['web'] and os.path.exists('/run/control/control.sock')"]
+      interval: 20s
+      timeout: 4s
+      start_period: 45s
+
+networks:
+  # Keep this name after "default" in the alphabet: Docker takes the internet route from the first network.
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${NESTUNIFI_LAN_INTERFACE:?Zet NESTUNIFI_LAN_INTERFACE in .env op de bedrade netwerkinterface van dit systeem, of draai ./install.sh}
+    # A placeholder range that exists on no network. NestUnifi removes the address Docker hands out from it.
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24

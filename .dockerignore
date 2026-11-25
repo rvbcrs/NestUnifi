@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!UPSTREAM-LICENSE
+!admin/
+!admin/*.py
+!admin/index.html
+!admin/app.css
+!admin/app.js
+!admin/assets/
+!admin/assets/**
+!suite/
+!suite/**
