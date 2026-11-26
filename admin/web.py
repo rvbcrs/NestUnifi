@@ -3,10 +3,8 @@ import ipaddress
 import json
 import os
 import re
-import secrets
 import socket
 import socketserver
-import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
@@ -20,12 +18,7 @@ MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
 ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest",
-           "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose",
-           "auth", "claim", "login", "logout"}
-# Everything else needs a session. A session starts when the worker accepts the admin password.
-OPEN = {"auth", "claim", "login", "logout"}
-SESSIONS = {}
-LIFETIME = 30 * 24 * 3600
+           "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose"}
 # Google returns the browser to /oauth2callback with the code in the query. The page itself hands it in.
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/oauth2callback": ("index.html", "text/html; charset=utf-8"),
           "/app.css": ("app.css", "text/css"), "/app.js": ("app.js", "text/javascript")}
@@ -45,12 +38,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, status, data=b"", mime="application/json", cookie=None):
+    def reply(self, status, data=b"", mime="application/json"):
         if not isinstance(data, bytes):
             data = json.dumps(data).encode()
         self.send_response(status)
-        if cookie is not None:
-            self.send_header("Set-Cookie", self.cookie_name() + "=" + cookie + "; Path=/; HttpOnly; SameSite=Strict")
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -61,12 +52,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def local(self):
-        """A first barrier before the login: visitors that are not on the public internet (the home network, a
-        VPN, this system itself) and that address the page by IP or by a listed name.
+        """The page has no password of its own. It answers visitors that are not on the public internet (the home
+        network, a VPN, this system itself) and that address the page by IP or by a listed name. Whoever puts it
+        behind a reverse proxy puts the sign-in there, for example Cloudflare Access.
 
         A page elsewhere on the web can point a host name of its own at this address and reach it through the
-        visitor's browser. Such a request carries that name, so an unknown name is refused. Behind a reverse
-        proxy every visitor has the proxy's address, so this check is never the only protection.
+        visitor's browser. Such a request carries that name, so an unknown name is refused.
         """
         host = urlsplit("//" + self.headers.get("Host", "")).hostname or ""
         try:
@@ -75,29 +66,6 @@ class Handler(BaseHTTPRequestHandler):
             if host != "localhost" and host not in NAMES:
                 return False
         return not ipaddress.ip_address(self.client_address[0]).is_global
-
-    def cookie_name(self):
-        """A name of its own for each scheme and port. Browsers share cookies between the ports of an address, and
-        never let a page over http replace a Secure cookie. With one name, a second NestUnifi on this system or an
-        earlier visit over https would end this session, or keep it from starting."""
-        origin = urlsplit(self.headers.get("Origin") or "")
-        secure = origin.scheme == "https"
-        return "nestunifi-%s%d" % ("s" if secure else "", origin.port or (443 if secure else 80))
-
-    def session(self):
-        # Browsers also send the cookies of other apps on this address, whatever their port. Python's cookie
-        # parser silently drops everything after a value it cannot read, so only our own pairs are looked up.
-        # The value is the secret; any of our names may carry it.
-        token = ""
-        for pair in ";".join(self.headers.get_all("Cookie") or []).split(";"):
-            name, _, value = pair.strip().partition("=")
-            if name.startswith("nestunifi-") and value in SESSIONS:
-                token = value
-                break
-        if SESSIONS.get(token, 0) > time.time():
-            return token
-        SESSIONS.pop(token, None)
-        return ""
 
     def refuse(self):
         self.reply(403, "Open NestUnifi vanaf je thuisnetwerk via het IP-adres van dit systeem. Gebruik je een eigen "
@@ -129,13 +97,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.refuse()
         match = LIVE.fullmatch(self.path)
         if match:
-            if not self.session():
-                return self.reply(401, {})
             return self.video(match[1], match[2])
         match = STILL.fullmatch(self.path)
         if match and int(match[1]) <= 254:
-            if not self.session():
-                return self.reply(401, {})
             return self.still(int(match[1]))
         path = urlsplit(self.path).path
         if path not in STATIC or (path != self.path and path != "/oauth2callback"):
@@ -163,12 +127,6 @@ class Handler(BaseHTTPRequestHandler):
         action = self.path.removeprefix("/api/")
         if self.path != "/api/"+action or action not in ACTIONS:
             return self.reply(404, {})
-        token = self.session()
-        if action == "logout":
-            SESSIONS.pop(token, None)
-            return self.reply(200, {}, cookie="; Max-Age=0")
-        if action not in OPEN and not token:
-            return self.reply(401, {"error": "Meld je aan om verder te gaan."})
         try:
             with socket.socket(socket.AF_UNIX) as conn:
                 conn.settimeout(200)
@@ -181,16 +139,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(503, {"error": "De beheerservice is niet bereikbaar. Vernieuw het overzicht."})
         if not response["ok"]:
             return self.reply(409, {"error": response["error"]})
-        result, cookie = response["result"], None
-        if action in ("claim", "login"):
-            if action == "claim":
-                SESSIONS.clear()  # A new password was chosen. Sessions from the previous one end here.
-            token = secrets.token_urlsafe(32)
-            SESSIONS[token] = time.time() + LIFETIME
-            cookie = token + "; Max-Age=%d" % LIFETIME + ("; Secure" if self.headers["Origin"].startswith("https://") else "")
-        if action == "auth":
-            result = dict(result, signed_in=bool(token))
-        self.reply(200, result, cookie=cookie)
+        self.reply(200, response["result"])
 
 
 class Web(socketserver.ThreadingMixIn, socketserver.TCPServer):

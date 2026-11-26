@@ -24,9 +24,8 @@ sh install.sh
 ```
 
 Het script zoekt de netwerkinterface op, downloadt NestUnifi en start het. Aan het eind staat het adres van de
-beheerpagina, bijvoorbeeld `http://192.168.1.10:8780/`. Open dat adres in je browser. Je kiest eerst een
-beheerwachtwoord. Daarna leidt de pagina je in vijf stappen door de koppeling met Google en het toevoegen van je
-camera's.
+beheerpagina, bijvoorbeeld `http://192.168.1.10:8780/`. Open dat adres in je browser. De pagina leidt je in vijf
+stappen door de koppeling met Google en het toevoegen van je camera's.
 
 Liever met de hand, of via het beheerscherm van je NAS? Maak naast `compose.yaml` een bestand `.env` met de
 naam van je bedrade interface en start het project:
@@ -49,9 +48,10 @@ De naam van de interface vind je met `ip -4 route show default`, achter het woor
 
 ## Goed om te weten
 
-- **Beheerwachtwoord.** Wie de pagina als eerste opent, kiest het wachtwoord. Doe dat dus direct na het
-  installeren. Vergeten? Verwijder het bestand `private/admin/auth.json` en vernieuw de pagina; je camera's en de
-  koppeling met Google blijven staan. Zet de poort niet open in je router.
+- **Geen wachtwoord op de beheerpagina.** Iedereen in je thuisnetwerk kan haar openen, je camera's bekijken en
+  instellingen wijzigen. Bezoekers van buiten je netwerk weigert ze. Zet de poort dus niet open in je router. Wil
+  je de pagina van buitenaf bereiken, zet haar dan achter een dienst die zelf om een aanmelding vraagt, zoals
+  Cloudflare Access, en zet die hostnaam in `NESTUNIFI_HOSTNAMES`.
 - **Vaste adressen.** Elke camera vraagt zelf een adres aan bij je router, en na een herstart hetzelfde adres
   opnieuw. De meeste routers geven het dan terug, zodat Protect de camera's terugvindt. Wil je zekerheid, leg
   de adressen dan ook in je router vast.

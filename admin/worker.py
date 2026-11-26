@@ -1,7 +1,6 @@
 """Camera-management requests received over the private Unix socket."""
 import base64
 import hashlib
-import hmac
 import http.client
 import ipaddress
 import secrets
@@ -31,9 +30,7 @@ BRIDGE = PRIVATE / "bridge/config.yaml"
 TOKENS = PRIVATE / "bridge/tokens.json"
 KEY_FILE = "pubsub-sa.json"
 SETUP = PRIVATE / "admin/setup.json"
-AUTH = PRIVATE / "admin/auth.json"
 NOTIFY = PRIVATE / "admin/notify.json"
-attempts = {"failed": 0, "until": 0.0}
 link_check = {"until": 0.0, "value": None}
 VERSION = os.environ.get("NESTUNIFI_VERSION", "dev")
 REPOSITORY = os.environ.get("NESTUNIFI_REPOSITORY", "")
@@ -829,7 +826,7 @@ def health_problems():
     expires = link_expiry()
     if link == "ok" and expires and 0 < expires - time.time() < 2 * 86400:
         problems["expiring"] = ("De koppeling met Google verloopt binnen twee dagen, omdat de inlog-app in Google Cloud nog "
-                                "op Testing staat. Kies daar Publish app en koppel daarna opnieuw op de beheerpagina.", None)
+                                "op Testing staat. Kies daar bij Audience voor Publish app en koppel daarna opnieuw op de beheerpagina.", None)
     if events_state(bridge) in ("denied", "missing", "key"):
         problems["events"] = ("NestUnifi kan het meldingskanaal van Google niet lezen. Bewegingen komen niet aan in Protect. "
                               "Open de beheerpagina om het te herstellen.", "Het meldingskanaal van Google werkt weer.")
@@ -922,7 +919,7 @@ def diagnose():
 
 
 def backup():
-    """Everything needed to move to another system, Google link included. The admin password stays behind."""
+    """Everything needed to move to another system, Google link included."""
     return {"nestunifi": 1, "version": VERSION,
             "files": {name: read(path) for name, (path, _) in BACKUP.items() if path.exists()}}
 
@@ -995,47 +992,8 @@ def restore(req):
     return setup_state(req.get("origin") or "")
 
 
-def password_hash(password, salt):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 600000).hex()
-
-
-def access(action, req):
-    """The admin password. The web process keeps the sessions; only this process can read the stored hash.
-
-    Deleting the file lets the next visitor choose a new password.
-    """
-    known = read(AUTH) if AUTH.exists() else None
-    if action == "auth":
-        return {"claimed": known is not None}
-    password = req.get("password")
-    usable = isinstance(password, str) and 10 <= len(password) <= 128
-    if action == "claim":
-        if known:
-            raise Problem("Er is al een beheerwachtwoord ingesteld. Meld je daarmee aan.")
-        if not usable:
-            raise Problem("Kies een wachtwoord van 10 tot 128 tekens.")
-        salt = secrets.token_hex(16)
-        replace(AUTH, {"salt": salt, "hash": password_hash(password, salt)})
-        return {}
-    if known is None:
-        raise Problem("Er is nog geen beheerwachtwoord ingesteld. Vernieuw de pagina.")
-    wait = attempts["until"] - time.monotonic()
-    if wait > 0:
-        raise Problem("Te veel pogingen. Probeer het over %d seconden opnieuw." % (wait + 1))
-    if not usable or not hmac.compare_digest(password_hash(password, known["salt"]), known["hash"]):
-        # After five misses every further miss costs a minute, whoever is guessing.
-        attempts["failed"] += 1
-        if attempts["failed"] >= 5:
-            attempts["until"] = time.monotonic() + 60
-        raise Problem("Onjuist wachtwoord.")
-    attempts["failed"] = 0
-    return {}
-
-
 def dispatch(req):
     action = req.get("action")
-    if action in ("auth", "claim", "login"):
-        return access(action, req)
     if action == "list":
         return status()
     if action == "discover":

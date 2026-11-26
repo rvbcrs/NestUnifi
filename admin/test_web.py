@@ -37,52 +37,21 @@ class Routes(unittest.TestCase):
         self.addCleanup(mock.stop)
         self.host = "127.0.0.1:%d" % self.servers[1].server_address[1]
         self.browser = {"Origin": "http://" + self.host, "X-NestUnifi": "1", "Content-Type": "application/json"}
-        self.cookie = ""
-        self.assertEqual(self.request("POST", "/api/login", '{"password": "geheim-wachtwoord"}', **self.browser)[0], 200)
-        self.cookie = self.answer.getheader("Set-Cookie").split(";")[0]
         Worker.seen.clear()
 
     def request(self, method, path, body=None, **headers):
         conn = http.client.HTTPConnection(self.host, timeout=5)
         self.addCleanup(conn.close)
-        conn.request(method, path, body, dict({"Cookie": self.cookie}, **headers))
+        conn.request(method, path, body, headers)
         self.answer = conn.getresponse()
         return self.answer.status, self.answer.read()
 
-    def test_nothing_but_the_login_works_without_a_session(self):
-        rules = self.answer.getheader("Set-Cookie")
-        port = self.host.rsplit(":", 1)[1]
-        self.assertRegex(rules, r"^nestunifi-" + port + r"=[A-Za-z0-9_-]{40,}; Max-Age=\d+; Path=/; HttpOnly; SameSite=Strict$")
-        stranger = dict(self.browser, Cookie="nestunifi-" + port + "=" + "a" * 43)
-        self.assertEqual(self.request("POST", "/api/list", "{}", **stranger)[0], 401)
-        self.assertEqual(self.request("GET", "/live/cam-a/index.m3u8", Cookie="")[0], 401)
-        self.assertEqual(self.request("GET", "/", Cookie="")[0], 200)
-        self.assertEqual(Worker.seen, [])
-        self.assertEqual(self.request("POST", "/api/auth", "{}", **stranger), (200, b'{"linked": false, "signed_in": false}'))
-        self.assertEqual(self.request("POST", "/api/auth", "{}", **self.browser), (200, b'{"linked": false, "signed_in": true}'))
-        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 200)
-        self.assertEqual(self.request("POST", "/api/logout", "{}", **self.browser)[0], 200)
-        self.assertTrue(self.answer.getheader("Set-Cookie").startswith("nestunifi-" + port + "=; Max-Age=0"))
-        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 401)
-        self.assertEqual(self.request("POST", "/api/login", "{}", **dict(self.browser, Origin="https://" + self.host))[0], 200)
-        # Over https the cookie has a name of its own: a browser never lets a page over http replace a Secure cookie.
-        self.assertRegex(self.answer.getheader("Set-Cookie"), "^nestunifi-s" + port + "=[^;]+; Max-Age=\\d+; Secure; ")
-        self.assertEqual(web.Handler.cookie_name(SimpleNamespace(headers={"Origin": "https://nas.example"})), "nestunifi-s443")
-        self.assertEqual(web.Handler.cookie_name(SimpleNamespace(headers={"Origin": "http://192.168.1.5"})), "nestunifi-80")
-
-    def test_choosing_a_new_password_ends_every_earlier_session(self):
-        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 200)
-        self.assertEqual(self.request("POST", "/api/claim", "{}", Cookie="", **self.browser)[0], 200)
-        fresh = self.answer.getheader("Set-Cookie").split(";")[0]
-        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 401)
-        self.assertEqual(self.request("POST", "/api/list", "{}", Cookie=fresh, **self.browser)[0], 200)
-
-    def test_session_survives_cookies_of_other_apps_on_the_same_address(self):
-        # Browsers send the cookies of every port of an address. Other apps on a NAS set values that
-        # Python's cookie parser cannot read, and that parser then drops every cookie after them.
-        for others in ('prefs={"theme":"dark"}', "greeting=hello world", "ui[sidebar]=1", 'q="a;b"', "flag", "=x"):
-            header = others + "; " + self.cookie + "; last=1"
-            self.assertEqual(self.request("POST", "/api/list", "{}", **dict(self.browser, Cookie=header))[0], 200, others)
+    def test_the_page_has_no_password_and_sets_no_cookie(self):
+        self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser), (200, b'{"linked": false}'))
+        self.assertIsNone(self.answer.getheader("Set-Cookie"))
+        for gone in ("auth", "claim", "login", "logout"):
+            self.assertEqual(self.request("POST", "/api/" + gone, "{}", **self.browser)[0], 404, gone)
+        self.assertEqual(Worker.seen, [{"action": "list", "origin": "http://" + self.host}])
 
     def test_google_return_address_serves_the_page(self):
         page = self.request("GET", "/")[1]
@@ -137,7 +106,6 @@ class Routes(unittest.TestCase):
             self.assertEqual(self.answer.getheader("Content-Type"), "image/jpeg")
             self.assertEqual(self.request("GET", "/snapshot/7.jpg?1764150000000")[0], 200)
             self.assertEqual(self.request("GET", "/snapshot/8.jpg")[0], 502)
-            self.assertEqual(self.request("GET", "/snapshot/7.jpg", Cookie="")[0], 401)
             for outside in ("/snapshot/0.jpg", "/snapshot/255.jpg", "/snapshot/7.jpg?x=1", "/snapshot/1.1.jpg", "/snapshot/7"):
                 self.assertEqual(self.request("GET", outside)[0], 404, outside)
         self.assertEqual(Camera.asked, ["/7", "/7", "/8"])

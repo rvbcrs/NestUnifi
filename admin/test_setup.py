@@ -162,9 +162,7 @@ class Wizard(unittest.TestCase):
     def test_backup_moves_to_a_new_installation(self):
         self.linked_with_camera()
         self.ask("notify", url="https://ntfy.example.com/deur", events=["chime"], health=True)
-        worker.replace(worker.AUTH, {"salt": "00", "hash": "geheim"})
         saved = json.loads(json.dumps(self.ask("backup")))
-        self.assertNotIn("admin/auth.json", saved["files"])
         old = {name: worker.read(path) for name, (path, _) in worker.BACKUP.items()}
         self.fresh_installation()
         key = worker.read(worker.MEDIA)["hlsCDNSecret"]
@@ -187,7 +185,7 @@ class Wizard(unittest.TestCase):
             expected = dict(old[name], hlsCDNSecret=key) if path == worker.MEDIA else old[name]
             self.assertEqual(worker.read(path), expected, name)
         self.assertNotIn("runOnInit", worker.read(worker.MEDIA))
-        self.assertFalse(worker.AUTH.exists() or worker.PENDING.exists())
+        self.assertFalse(worker.PENDING.exists())
         with self.assertRaisesRegex(worker.Problem, "zonder camera"):
             self.ask("restore", backup=saved)
 
@@ -410,28 +408,6 @@ class Wizard(unittest.TestCase):
         fresh = worker.read(worker.MEDIA)["authInternalUsers"][0]["pass"]
         self.assertNotEqual(fresh, media["authInternalUsers"][0]["pass"])
         self.assertIn(":" + fresh + "@", worker.read(worker.BRIDGE)["media"]["rtsp_base_url"])
-
-    def test_admin_password_is_chosen_once_and_guessing_is_slowed(self):
-        self.addCleanup(worker.attempts.update, failed=0, until=0.0)
-        self.assertEqual(self.ask("auth"), {"claimed": False})
-        with self.assertRaisesRegex(worker.Problem, "10 tot 128"):
-            self.ask("claim", password="te kort")
-        with self.assertRaisesRegex(worker.Problem, "nog geen"):
-            self.ask("login", password="geheim-wachtwoord")
-        self.ask("claim", password="geheim-wachtwoord")
-        self.assertEqual(self.ask("auth"), {"claimed": True})
-        self.assertNotIn("geheim", worker.AUTH.read_text())
-        with self.assertRaisesRegex(worker.Problem, "al een beheerwachtwoord"):
-            self.ask("claim", password="ander-wachtwoord")
-        self.assertEqual(self.ask("login", password="geheim-wachtwoord"), {})
-        for _ in range(5):
-            with self.assertRaisesRegex(worker.Problem, "Onjuist"):
-                self.ask("login", password="verkeerd-wachtwoord")
-        with self.assertRaisesRegex(worker.Problem, "Te veel pogingen"):
-            self.ask("login", password="geheim-wachtwoord")
-        worker.attempts["until"] = 0.0
-        self.assertEqual(self.ask("login", password="geheim-wachtwoord"), {})
-        self.assertEqual(worker.attempts["failed"], 0)
 
     def test_second_cloud_run_reuses_what_exists(self):
         self.ask("client", client_id=CLIENT, client_secret="GOCSPX-0123456789abcdef")

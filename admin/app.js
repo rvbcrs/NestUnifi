@@ -14,8 +14,6 @@ function message(id, value = "", error = false) {
 async function api(action, data = {}) {
   const r = await fetch("/api/" + action, {method: "POST", headers: {"Content-Type": "application/json", "X-NestUnifi": "1"}, body: JSON.stringify(data)});
   const json = await r.json().catch(() => ({}));
-  // The session ended, for example after a restart. Ask for the password again.
-  if (r.status === 401) showAccess(true);
   if (!r.ok) throw new Error(json.error || "NestUnifi is niet bereikbaar.");
   return json;
 }
@@ -95,7 +93,7 @@ function renderDevices() {
 }
 // What Google's answer about the stored link means, and which setup step repairs it.
 const linkProblems = {
-  revoked: ["Google heeft de toegang van NestUnifi ingetrokken of laten verlopen. Je camera’s krijgen dan geen beeld. Koppel ze opnieuw in stap 4 van de installatie. Staat je app in Google Cloud nog op Testing? Zet hem dan eerst op In production, anders verloopt de koppeling elke 7 dagen.", "Opnieuw koppelen", 3],
+  revoked: ["Google heeft de toegang van NestUnifi ingetrokken of laten verlopen. Je camera’s krijgen dan geen beeld. Koppel ze opnieuw in stap 4 van de installatie. Staat je app in Google Cloud op External en nog op Testing? Kies dan eerst Publish app, anders verloopt de koppeling elke 7 dagen.", "Opnieuw koppelen", 3],
   client: ["Google weigert de inlog-app van NestUnifi. Misschien is de OAuth-client verwijderd of het clientgeheim vernieuwd. Vul de gegevens opnieuw in bij stap 1 en koppel daarna opnieuw in stap 4.", "Inlog-app bijwerken", 0],
   unreachable: ["NestUnifi kon de Google-koppeling niet controleren. Controleer de internetverbinding van dit systeem.", "", null]
 };
@@ -108,7 +106,7 @@ const eventProblems = {
 // The one thing that most needs attention: a broken link first, then one that is about to end, then missing events.
 function attention({google, link_expires, events}) {
   if (linkProblems[google]) return linkProblems[google];
-  if (link_expires * 1000 > Date.now()) return ["De koppeling met Google verloopt op " + when(link_expires * 1000) + ", omdat de inlog-app in Google Cloud nog op Testing staat. Kies daar Publish app, zoals in stap 1 staat, en koppel daarna opnieuw in stap 4.", "Naar stap 1", 0];
+  if (link_expires * 1000 > Date.now()) return ["De koppeling met Google verloopt op " + when(link_expires * 1000) + ", omdat de inlog-app in Google Cloud nog op Testing staat. Kies daar bij Audience voor Publish app en koppel daarna opnieuw in stap 4.", "Naar stap 1", 0];
   return eventProblems[events];
 }
 let repairStep = null;
@@ -468,8 +466,8 @@ function stepClient(s, form) {
   const list = make("ol");
   list.append(
     line("Maak een project aan in ", link("Google Cloud", cloud + "projectcreate"), ". Gebruik het Google-account waarin je Nest-camera’s staan. Dat moet een gewoon Google-account zijn, geen Workspace-account."),
-    line("Open ", link("Branding", cloud + "auth/branding"), " en kies Get started. Vul een app-naam in, bijvoorbeeld NestUnifi, en je e-mailadres. Kies External en rond af. Laat logo en domeinen leeg."),
-    line("Open ", link("Audience", cloud + "auth/audience"), " en kies Publish app. De status wordt dan In production. In de teststatus verloopt de koppeling elke 7 dagen."),
+    line("Open ", link("Branding", cloud + "auth/branding"), " en kies Get started. Vul een app-naam in, bijvoorbeeld NestUnifi, en je e-mailadres. Kies bij Audience voor Personal en rond af. Laat logo en domeinen leeg."),
+    line("Biedt Google geen Personal aan? Kies dan External, open daarna ", link("Audience", cloud + "auth/audience"), " en kies Publish app, zodat de status In production wordt. In de teststatus verloopt de koppeling elke 7 dagen."),
     line("Open ", link("Clients", cloud + "auth/clients"), ", kies Create client en daarna Web application. Voeg bij Authorized redirect URIs dit adres toe:", copyable(s.register)),
     line("Kies Create en neem de Client ID en het Client secret hieronder over."));
   form.onsubmit = e => {
@@ -505,7 +503,7 @@ function stepConsent(s, form, kind) {
   return [make("p", first
     ? "NestUnifi zet nu zelf de benodigde API’s aan en maakt het meldingskanaal voor beweging en de deurbel aan. Google vraagt daarvoor één keer toegang tot je Cloud-project. NestUnifi gebruikt die toegang alleen voor deze stap en bewaart haar niet."
     : "Kies bij Google je woning en zet de camera’s en deurbellen aan die je wilt gebruiken."),
-    make("p", "Google meldt dat de app niet is geverifieerd. Het is je eigen app: kies Advanced en daarna Go to NestUnifi (unsafe)."), begin, paste];
+    make("p", "Meldt Google dat de app niet is geverifieerd? Dat gebeurt als je in stap 1 External koos. Het is je eigen app: kies Advanced en daarna Go to NestUnifi (unsafe)."), begin, paste];
 }
 function stepProject(s, form) {
   const [label, project] = entry("accessProject", "Project ID");
@@ -703,7 +701,7 @@ function renderBackup(s) {
     btn.className = "quiet";
     return btn;
   };
-  box.append(make("h2", "Back-up"), make("p", "Het bestand bevat je instellingen en de koppeling met Google, maar niet je beheerwachtwoord. Bewaar het veilig en deel het met niemand: wie het heeft, kan je camera’s bekijken."),
+  box.append(make("h2", "Back-up"), make("p", "Het bestand bevat je instellingen en de koppeling met Google. Bewaar het veilig en deel het met niemand: wie het heeft, kan je camera’s bekijken."),
     download("Back-up downloaden", "backup", "backup"),
     make("h2", "Hulp bij een probleem"), make("p", "Het diagnosebestand bevat de versie, de toestand van elk onderdeel en de laatste logregels. Wachtwoorden, sleutels en de koppeling met Google staan er niet in; de namen en netwerkadressen van je camera’s wel. Voeg het toe als je een probleem meldt."),
     download("Diagnose downloaden", "diagnose", "diagnose"), note);
@@ -733,49 +731,12 @@ el("openSetup").onclick = async () => {
     showSetup();
   } catch (e) { message("notice", e.message, true); }
 };
-// The first visitor chooses the admin password. After that every visit starts by signing in.
-function showAccess(claimed) {
-  for (const id of ["setup", "overview", "bridge", "openSetup", "signOut"]) el(id).hidden = true;
-  if (el("modal").open) el("modal").close();
-  el("access").hidden = false;
-  el("accessTitle").textContent = claimed ? "Aanmelden" : "Welkom bij NestUnifi";
-  el("accessHint").textContent = claimed ? "Vul je beheerwachtwoord in." : "Kies eerst een beheerwachtwoord. Daarmee meld je je voortaan aan op deze pagina.";
-  const form = el("accessForm"), fields = [];
-  form.replaceChildren();
-  for (const [id, title] of claimed ? [["adminPassword", "Beheerwachtwoord"]] : [["adminPassword", "Nieuw beheerwachtwoord"], ["adminRepeat", "Herhaal het wachtwoord"]]) {
-    const [label, input] = entry(id, title, "password");
-    input.autocomplete = claimed ? "current-password" : "new-password";
-    input.minLength = 10;
-    input.maxLength = 128;
-    fields.push(input);
-    form.append(label, input);
-  }
-  const status = make("p", undefined, "message");
-  status.setAttribute("role", "status");
-  form.append(claimed ? make("p", "Wachtwoord vergeten? Verwijder het bestand private/admin/auth.json op het systeem waar NestUnifi draait en vernieuw deze pagina.") : make("p", "Gebruik minstens 10 tekens."), submit(claimed ? "Aanmelden" : "Wachtwoord instellen"), status);
-  form.onsubmit = e => {
-    e.preventDefault();
-    act(form, "Controleren…", async () => {
-      if (!claimed && fields[0].value !== fields[1].value) throw new Error("De wachtwoorden verschillen.");
-      await api(claimed ? "login" : "claim", {password: fields[0].value});
-      el("access").hidden = true;
-      await start();
-    });
-  };
-}
-el("signOut").onclick = async () => {
-  await api("logout").catch(() => {});
-  showAccess(true);
-};
 async function start() {
   const back = new URLSearchParams(location.search), returning = location.pathname === "/oauth2callback";
   let note;
   // Take the one-time code out of the address bar and the history before anything else.
   if (returning) history.replaceState(null, "", "/");
   try {
-    const access = await api("auth");
-    if (!access.claimed || !access.signed_in) return showAccess(access.claimed);
-    el("signOut").hidden = false;
     if (returning && back.get("code")) {
       message("notice", "Koppeling met Google afronden. Dit kan een minuut duren…");
       try { setupState = await api("code", {code: back.get("code"), state: back.get("state")}); }
