@@ -1,7 +1,9 @@
 """Exercise configuration changes and crash recovery without a running container or Google."""
+import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -72,6 +74,60 @@ class CameraChanges(unittest.TestCase):
             self.assertEqual(runtime.remembered(), {"02:aa": "192.168.1.42", "02:bb": "192.168.1.41"})
             runtime.ADDRESSES.write_text("[")
             self.assertEqual(runtime.remembered(), {})
+
+    def test_service_output_is_passed_on_and_kept(self):
+        with patch.object(runtime, "LOG", Path("log.txt")), patch.object(runtime.sys, "stdout", io.StringIO()) as shown:
+            runtime.spawn(["sh", "-c", "echo started; echo failed >&2"]).wait()
+            for _ in range(50):
+                if shown.getvalue().count("\n") == 2:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(sorted(shown.getvalue().split()), ["failed", "started"])
+            kept = runtime.LOG.read_text().splitlines()
+            self.assertEqual(sorted(line.split()[-1] for line in kept), ["failed", "started"])
+            self.assertRegex(kept[0], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
+            runtime.LOG.write_text("x" * (128 * 1024 + 1))
+            runtime.keep("next\n")
+            self.assertEqual(len(runtime.LOG.with_suffix(".old").read_text()), 128 * 1024 + 1)
+            self.assertTrue(runtime.LOG.read_text().endswith(" next\n"))
+
+    def test_pause_keeps_the_camera_in_every_file_and_out_of_the_bridge(self):
+        self.assertEqual(worker.dispatch({"action": "pause", "id": "fixed-id", "paused": True}), {"name": "Keuken camera", "paused": True})
+        self.assertIs(worker.read(worker.ONVIF)["devices"][0]["paused"], True)
+        self.assertIs(worker.read(worker.BRIDGE)["cameras"][0]["paused"], True)
+        self.assertNotIn("paused", device_config(worker.read(worker.ONVIF)["devices"][0])["devices"][0])
+        self.assertEqual(worker.read(worker.MEDIA), self.media)
+        before = worker.BRIDGE.stat().st_mtime_ns
+        worker.dispatch({"action": "pause", "id": "fixed-id", "paused": True})  # Already paused: nothing restarts.
+        self.assertEqual(worker.BRIDGE.stat().st_mtime_ns, before)
+        self.assertEqual(worker.dispatch({"action": "pause", "id": "fixed-id", "paused": False}), {"name": "Keuken camera", "paused": False})
+        self.assertEqual((worker.read(worker.ONVIF), worker.read(worker.BRIDGE)), (self.onvif, self.bridge))
+        # A pause that cannot be applied is undone, without waiting for a camera that is meant to be offline.
+        with patch.object(worker, "ready", side_effect=[worker.Problem("start mislukt"), None]) as ready:
+            with self.assertRaises(worker.Problem):
+                worker.dispatch({"action": "pause", "id": "fixed-id", "paused": True})
+        self.assertEqual(ready.call_args_list[-1].args, (None,))
+        self.assertEqual((worker.read(worker.ONVIF), worker.read(worker.BRIDGE)), (self.onvif, self.bridge))
+        self.assertFalse(worker.PENDING.exists())
+
+    def test_video_sessions_are_followed_from_what_the_bridge_says(self):
+        self.addCleanup(runtime.sessions.clear)
+        say = lambda name, state: runtime.session('2026/11/26 10:00:00 INFO session state changed camera=%s state=%s\n' % (name, state))
+        runtime.session("2026/11/26 10:00:00 INF [RTSP] [conn 127.0.0.1:51064] opened\n")
+        self.assertEqual(runtime.sessions, {})
+        for state in ("connecting", "live", "renewing", "live"):  # Renewing a session keeps the video.
+            say('"Keuken camera"', state)
+        since = runtime.sessions["Keuken camera"]["since"]
+        self.assertAlmostEqual(since, time.time(), delta=5)
+        self.assertEqual(runtime.sessions["Keuken camera"], {"state": "live", "since": since, "drops": 0})
+        for state in ("failed", "backoff", "connecting"):
+            say('"Keuken camera"', state)
+        say("device-0123", "live")
+        self.assertEqual(runtime.sessions["Keuken camera"], {"state": "connecting", "since": since, "drops": 1})
+        self.assertEqual(runtime.sessions["device-0123"]["state"], "live")
+        # The admin page finds each camera's session by its stream path.
+        self.assertEqual(worker.sessions({"streams": runtime.sessions})["cam-keuken-camera"]["drops"], 1)
+        self.assertEqual(worker.sessions({}), {})
 
     def test_update_is_offered_only_for_a_newer_release(self):
         self.addCleanup(worker.update_check.update, until=0.0, value=None)

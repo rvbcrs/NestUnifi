@@ -1,0 +1,317 @@
+diff --git a/internal/cli/serve.go b/internal/cli/serve.go
+index ef3d0a4..d2972fa 100644
+--- a/internal/cli/serve.go
++++ b/internal/cli/serve.go
+@@ -133,8 +133,11 @@ func startEvents(ctx context.Context, cfg *config.Config, cfgPath string, clock
+ 
+ 	// The SDM user token cannot read Pub/Sub — sdm.service is the only scope the
+ 	// SDM API issues — so events authenticate as a separate service account.
++	// NestUnifi's admin page reads from this file whether the subscription works.
++	report := events.StatusFile(os.Getenv("NEST_EVENTS_STATUS"))
+ 	tokenSource, err := events.TokenSourceFromKeyFile(ctx, resolveConfigPath(cfgPath, cfg.Google.ServiceAccountKey))
+ 	if err != nil {
++		report(err)
+ 		log.Warn("nest detections → ONVIF motion disabled", "error", err)
+ 		return rt
+ 	}
+@@ -155,11 +158,25 @@ func startEvents(ctx context.Context, cfg *config.Config, cfgPath string, clock
+ 	tracker.Logger = log
+ 
+ 	devices := make([]string, 0, len(eventCameras))
++	byDevice := make(map[string]config.Camera, len(eventCameras))
+ 	for _, cam := range eventCameras {
+ 		devices = append(devices, cam.DeviceID)
++		byDevice[cam.DeviceID] = cam
+ 	}
+-	sub := events.NewSubscriber(cfg.Google.PubSubSubscription, devices, tokenSource, tracker.Handle)
++	// The motion level hides what was detected, so each camera also hears the
++	// kind of every detection. Off the pull loop: a slow camera must not hold it.
++	handle := func(e events.Event) {
++		tracker.Handle(e)
++		cam := byDevice[e.DeviceID]
++		go func() {
++			if err := trigger.Report(eventsCtx, cam, e.Kind); err != nil {
++				log.Debug("detection report failed", "camera", cam.Name, "error", err)
++			}
++		}()
++	}
++	sub := events.NewSubscriber(cfg.Google.PubSubSubscription, devices, tokenSource, handle)
+ 	sub.Logger = log
++	sub.Report = report
+ 
+ 	log.Info("nest detections → ONVIF motion enabled", "devices", len(devices))
+ 	rt.enabled = true
+diff --git a/internal/config/config.go b/internal/config/config.go
+index b910f76..0aba8ea 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -79,6 +79,8 @@ type Camera struct {
+ 	EventsEnabled bool          `yaml:"-"`
+ 	Linger        time.Duration `yaml:"-"`
+ 	ONVIF         ONVIFConfig   `yaml:"onvif"`
++	// Paused is NestUnifi's: the camera stays in the file but is not streamed.
++	Paused bool `yaml:"-"`
+ }
+ 
+ func (c *Camera) UnmarshalYAML(value *yaml.Node) error {
+@@ -86,6 +88,7 @@ func (c *Camera) UnmarshalYAML(value *yaml.Node) error {
+ 		DeviceID string `yaml:"device_id"`
+ 		Name     string `yaml:"name"`
+ 		Audio    bool   `yaml:"audio"`
++		Paused   bool   `yaml:"paused"`
+ 		Event    *struct {
+ 			Linger string `yaml:"linger"`
+ 		} `yaml:"event"`
+@@ -98,6 +101,7 @@ func (c *Camera) UnmarshalYAML(value *yaml.Node) error {
+ 	c.DeviceID = raw.DeviceID
+ 	c.Name = raw.Name
+ 	c.Audio = raw.Audio
++	c.Paused = raw.Paused
+ 	c.ONVIF = raw.ONVIF
+ 	if raw.Event != nil {
+ 		c.EventsEnabled = true
+@@ -156,6 +160,14 @@ func Load(path string) (*Config, error) {
+ 	if err := c.validate(); err != nil {
+ 		return nil, err
+ 	}
++	// A paused camera keeps its place and its addresses in the file, and nothing else sees it.
++	active := c.Cameras[:0]
++	for _, cam := range c.Cameras {
++		if !cam.Paused {
++			active = append(active, cam)
++		}
++	}
++	c.Cameras = active
+ 	return &c, nil
+ }
+ 
+diff --git a/internal/config/nestunifi_test.go b/internal/config/nestunifi_test.go
+new file mode 100644
+index 0000000..0171501
+--- /dev/null
++++ b/internal/config/nestunifi_test.go
+@@ -0,0 +1,16 @@
++package config
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestLoadLeavesPausedCamerasOut(t *testing.T) {
++	c, err := Load(write(t, strings.Replace(valid, `name: "Front Door"`, `name: "Front Door"
++    paused: true`, 1)))
++	require.NoError(t, err)
++	require.Len(t, c.Cameras, 1)
++	require.Equal(t, "Driveway", c.Cameras[0].Name)
++}
+diff --git a/internal/events/nestunifi.go b/internal/events/nestunifi.go
+new file mode 100644
+index 0000000..ffdd8ca
+--- /dev/null
++++ b/internal/events/nestunifi.go
+@@ -0,0 +1,64 @@
++package events
++
++// Additions for NestUnifi, which runs this bridge next to its own admin page.
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++
++	"github.com/ceb3/nest-to-ONVIF/internal/config"
++)
++
++// StatusFile returns a Subscriber.Report function that keeps path in step with
++// whether the subscription can be read. An empty path reports nowhere.
++func StatusFile(path string) func(error) {
++	return func(err error) {
++		if path == "" {
++			return
++		}
++		state := struct {
++			OK    bool   `json:"ok"`
++			Error string `json:"error,omitempty"`
++		}{OK: err == nil}
++		if err != nil {
++			state.Error = err.Error()
++		}
++		raw, _ := json.Marshal(state)
++		if os.WriteFile(path+".tmp", raw, 0o600) == nil {
++			_ = os.Rename(path+".tmp", path)
++		}
++	}
++}
++
++// Report tells a camera's own endpoint which detection arrived. Deliver carries
++// only the motion level, and that stays up while a doorbell press follows a
++// person, so every detection is reported on its own.
++func (t *Trigger) Report(ctx context.Context, cam config.Camera, kind Kind) error {
++	base := t.baseURL
++	if base == "" {
++		base = "http://" + cam.ONVIF.IP
++	}
++	ctx, cancel := context.WithTimeout(ctx, defaultTriggerTimeout)
++	defer cancel()
++
++	reqURL := base + "/trigger/event?" + url.Values{"kind": {string(kind)}}.Encode()
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
++	if err != nil {
++		return fmt.Errorf("build report request: %w", err)
++	}
++	resp, err := t.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("post report: %w", err)
++	}
++	defer func() { _ = resp.Body.Close() }()
++	_, _ = io.Copy(io.Discard, resp.Body)
++	if resp.StatusCode != http.StatusOK {
++		return fmt.Errorf("report returned HTTP %d", resp.StatusCode)
++	}
++	return nil
++}
+diff --git a/internal/events/nestunifi_test.go b/internal/events/nestunifi_test.go
+new file mode 100644
+index 0000000..59436c2
+--- /dev/null
++++ b/internal/events/nestunifi_test.go
+@@ -0,0 +1,80 @@
++package events
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/ceb3/nest-to-ONVIF/internal/config"
++)
++
++func TestSubscriberReportsEachChangeOfOutcomeOnce(t *testing.T) {
++	stub := newPubSubStub()
++	stub.failNext = true
++	s := runSubscriber(t, stub, []string{testDeviceOne}, func(Event) {})
++	s.ErrorDelay = time.Millisecond
++
++	var mu sync.Mutex
++	var seen []bool
++	s.Report = func(err error) {
++		mu.Lock()
++		seen = append(seen, err == nil)
++		mu.Unlock()
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan struct{})
++	go func() { defer close(done); s.Run(ctx) }()
++	for i := 0; i < 3; i++ { // the pulls after the failure all succeed
++		select {
++		case <-stub.pulled:
++		case <-time.After(2 * time.Second):
++			t.Fatal("subscriber did not pull")
++		}
++	}
++	cancel()
++	<-done
++
++	mu.Lock()
++	defer mu.Unlock()
++	assert.Equal(t, []bool{false, true}, seen)
++}
++
++func TestStatusFileHoldsTheLatestOutcome(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "events.json")
++	report := StatusFile(path)
++
++	report(errors.New("pubsub: HTTP 403 (PERMISSION_DENIED)"))
++	raw, err := os.ReadFile(path)
++	require.NoError(t, err)
++	assert.JSONEq(t, `{"ok":false,"error":"pubsub: HTTP 403 (PERMISSION_DENIED)"}`, string(raw))
++
++	report(nil)
++	raw, err = os.ReadFile(path)
++	require.NoError(t, err)
++	assert.JSONEq(t, `{"ok":true}`, string(raw))
++
++	StatusFile("")(nil) // nowhere to report to
++}
++
++func TestTriggerReportsTheKindOfDetection(t *testing.T) {
++	var got string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		got = r.Method + " " + r.URL.Path + "?" + r.URL.RawQuery
++	}))
++	t.Cleanup(srv.Close)
++
++	tr := NewTrigger(WithTriggerHTTPClient(srv.Client()), WithTriggerBaseURL(srv.URL))
++	cam := config.Camera{Name: "Front door", ONVIF: config.ONVIFConfig{IP: "192.0.2.9"}}
++	require.NoError(t, tr.Report(context.Background(), cam, KindChime))
++	assert.Equal(t, "POST /trigger/event?kind=chime", got)
++}
+diff --git a/internal/events/subscriber.go b/internal/events/subscriber.go
+index 0d22c56..e8bd5e8 100644
+--- a/internal/events/subscriber.go
++++ b/internal/events/subscriber.go
+@@ -165,6 +165,11 @@ type Subscriber struct {
+ 	// outage does not turn into a hot retry loop.
+ 	ErrorDelay time.Duration
+ 
++	// Report, when set, hears the outcome of a pull each time it differs from
++	// the one before.
++	Report   func(error)
++	reported string
++
+ 	Logger *slog.Logger
+ }
+ 
+@@ -245,12 +250,14 @@ func (s *Subscriber) Run(ctx context.Context) {
+ 			if ctx.Err() != nil {
+ 				break
+ 			}
++			s.report(err)
+ 			s.log().Warn("pubsub pull failed", "error", err, "retry_in", s.ErrorDelay)
+ 			if sleepCtx(ctx, s.ErrorDelay) != nil {
+ 				break
+ 			}
+ 			continue
+ 		}
++		s.report(nil)
+ 		if len(msgs) == 0 {
+ 			if sleepCtx(ctx, s.IdleDelay) != nil {
+ 				break
+@@ -274,6 +281,20 @@ func (s *Subscriber) Run(ctx context.Context) {
+ 	s.log().Info("device event subscriber stopped")
+ }
+ 
++func (s *Subscriber) report(err error) {
++	if s.Report == nil {
++		return
++	}
++	outcome := "ok"
++	if err != nil {
++		outcome = err.Error()
++	}
++	if outcome != s.reported {
++		s.reported = outcome
++		s.Report(err)
++	}
++}
++
+ func (s *Subscriber) dispatch(raw []byte) {
+ 	if s.log().Enabled(context.Background(), slog.LevelDebug) {
+ 		device, names := summarize(raw)

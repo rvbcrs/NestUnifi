@@ -51,8 +51,9 @@ class Routes(unittest.TestCase):
 
     def test_nothing_but_the_login_works_without_a_session(self):
         rules = self.answer.getheader("Set-Cookie")
-        self.assertRegex(rules, r"^nestunifi=[A-Za-z0-9_-]{40,}; Max-Age=\d+; Path=/; HttpOnly; SameSite=Strict$")
-        stranger = dict(self.browser, Cookie="nestunifi=" + "a" * 43)
+        port = self.host.rsplit(":", 1)[1]
+        self.assertRegex(rules, r"^nestunifi-" + port + r"=[A-Za-z0-9_-]{40,}; Max-Age=\d+; Path=/; HttpOnly; SameSite=Strict$")
+        stranger = dict(self.browser, Cookie="nestunifi-" + port + "=" + "a" * 43)
         self.assertEqual(self.request("POST", "/api/list", "{}", **stranger)[0], 401)
         self.assertEqual(self.request("GET", "/live/cam-a/index.m3u8", Cookie="")[0], 401)
         self.assertEqual(self.request("GET", "/", Cookie="")[0], 200)
@@ -61,10 +62,13 @@ class Routes(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/auth", "{}", **self.browser), (200, b'{"linked": false, "signed_in": true}'))
         self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 200)
         self.assertEqual(self.request("POST", "/api/logout", "{}", **self.browser)[0], 200)
-        self.assertIn("Max-Age=0", self.answer.getheader("Set-Cookie"))
+        self.assertTrue(self.answer.getheader("Set-Cookie").startswith("nestunifi-" + port + "=; Max-Age=0"))
         self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 401)
         self.assertEqual(self.request("POST", "/api/login", "{}", **dict(self.browser, Origin="https://" + self.host))[0], 200)
-        self.assertIn("; Secure;", self.answer.getheader("Set-Cookie"))
+        # Over https the cookie has a name of its own: a browser never lets a page over http replace a Secure cookie.
+        self.assertRegex(self.answer.getheader("Set-Cookie"), "^nestunifi-s" + port + "=[^;]+; Max-Age=\\d+; Secure; ")
+        self.assertEqual(web.Handler.cookie_name(SimpleNamespace(headers={"Origin": "https://nas.example"})), "nestunifi-s443")
+        self.assertEqual(web.Handler.cookie_name(SimpleNamespace(headers={"Origin": "http://192.168.1.5"})), "nestunifi-80")
 
     def test_choosing_a_new_password_ends_every_earlier_session(self):
         self.assertEqual(self.request("POST", "/api/list", "{}", **self.browser)[0], 200)
@@ -111,6 +115,32 @@ class Routes(unittest.TestCase):
         self.assertTrue(visitor("100.101.102.103", "192.168.1.5:8780"))  # a VPN peer
         self.assertFalse(visitor("8.8.8.8", "192.168.1.5:8780"))
         self.assertFalse(visitor("192.168.1.20", "nas.example"))
+
+    def test_camera_still_comes_from_its_private_listener(self):
+        class Camera(http.server.BaseHTTPRequestHandler):
+            asked = []
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.asked.append(self.path)
+                self.send_response(200 if self.path == "/7" else 502)
+                self.end_headers()
+                self.wfile.write(b"JPEG" if self.path == "/7" else b"")
+        camera = socketserver.TCPServer(("127.0.0.1", 0), Camera)
+        threading.Thread(target=camera.serve_forever, daemon=True).start()
+        self.addCleanup(camera.server_close)
+        self.addCleanup(camera.shutdown)
+        with patch.object(web, "STILL_SOURCE", "http://127.0.0.1:%d/%%d" % camera.server_address[1]):
+            self.assertEqual(self.request("GET", "/snapshot/7.jpg"), (200, b"JPEG"))
+            self.assertEqual(self.answer.getheader("Content-Type"), "image/jpeg")
+            self.assertEqual(self.request("GET", "/snapshot/7.jpg?1764150000000")[0], 200)
+            self.assertEqual(self.request("GET", "/snapshot/8.jpg")[0], 502)
+            self.assertEqual(self.request("GET", "/snapshot/7.jpg", Cookie="")[0], 401)
+            for outside in ("/snapshot/0.jpg", "/snapshot/255.jpg", "/snapshot/7.jpg?x=1", "/snapshot/1.1.jpg", "/snapshot/7"):
+                self.assertEqual(self.request("GET", outside)[0], 404, outside)
+        self.assertEqual(Camera.asked, ["/7", "/7", "/8"])
 
     def test_live_video_comes_from_the_media_server_with_its_key(self):
         class Media(http.server.BaseHTTPRequestHandler):

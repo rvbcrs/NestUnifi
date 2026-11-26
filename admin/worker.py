@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -31,6 +32,7 @@ TOKENS = PRIVATE / "bridge/tokens.json"
 KEY_FILE = "pubsub-sa.json"
 SETUP = PRIVATE / "admin/setup.json"
 AUTH = PRIVATE / "admin/auth.json"
+NOTIFY = PRIVATE / "admin/notify.json"
 attempts = {"failed": 0, "until": 0.0}
 link_check = {"until": 0.0, "value": None}
 VERSION = os.environ.get("NESTUNIFI_VERSION", "dev")
@@ -41,6 +43,8 @@ ONVIF = PRIVATE / "onvif/config.yaml"
 MEDIA = PRIVATE / "media/mediamtx.yml"
 PENDING = PRIVATE / "admin/pending.json"
 STATE = Path("/run/suite-status.json")
+EVENTS = Path("/run/bridge/events.json")  # The bridge keeps here whether it can read Google's event subscription.
+LOG = Path("/run/suite-log.txt")  # The supervisor keeps the latest output of every service here.
 CONTROL = Path("/run/control/control.sock")
 ORIGIN = "nestunifi:"
 MAX_NAME = 48
@@ -48,12 +52,15 @@ MAX_REQUEST = 256 * 1024  # A backup is the largest request.
 FAMILIES = {"CAMERA": "Nest Cam", "DOORBELL": "Nest Doorbell", "DISPLAY": "Nest Hub"}
 # What a restored configuration keeps of the backup.
 GOOGLE_KEYS = {"client_id", "client_secret", "project_id", "redirect_uri", "pubsub_subscription", "service_account_key"}
-DEVICE_KEYS = {"name", "display_name", "kind", "uuid", "mac", "serial", "ports", "info", "auth", "streams"}
+DEVICE_KEYS = {"name", "display_name", "kind", "uuid", "mac", "serial", "ports", "info", "auth", "streams", "paused"}
 # Each file in a backup, with the user the services read it as.
 BACKUP = {"bridge/config.yaml": (BRIDGE, 10001), "bridge/tokens.json": (TOKENS, 10001),
           "bridge/" + KEY_FILE: (BRIDGE.parent / KEY_FILE, 10001), "media/mediamtx.yml": (MEDIA, 10002),
           "onvif/config.yaml": (ONVIF, 0), "onvif/addresses.json": (ONVIF.parent / "addresses.json", 0),
-          "admin/setup.json": (SETUP, 0)}
+          "admin/setup.json": (SETUP, 0), "admin/notify.json": (NOTIFY, 0)}
+# The detections a webhook can hear about, with the message for each.
+KINDS = {"chime": "Er wordt aangebeld bij %s.", "person": "Persoon gezien bij %s.", "motion": "Beweging bij %s."}
+HOLD = 300  # A problem is reported once it has lasted this many seconds.
 
 
 class Problem(Exception):
@@ -197,20 +204,88 @@ def source_live(cam):
     return {200: True, 404: False}.get(code)
 
 
-def motion(address):
-    """What the camera itself knows about the latest motion the bridge forwarded. None without events."""
-    if not address:
-        return None
+def camera_call(address, method="GET", path="/trigger/motion"):
+    """Ask a camera's private listener. Gives the status and the body, or None when it does not answer."""
     conn = http.client.HTTPConnection(address, 80, timeout=0.5)
     try:
-        conn.request("GET", "/trigger/motion")
+        conn.request(method, path)
         response = conn.getresponse()
-        answer = json.loads(response.read(512)) if response.status == 200 else None
-        return answer if isinstance(answer, dict) else None
-    except (OSError, ValueError, http.client.HTTPException):
-        return None
+        return response.status, response.read(2048)
+    except (OSError, http.client.HTTPException):
+        return None, b""
     finally:
         conn.close()
+
+
+def motion_addresses(bridge):
+    """The private address of each camera that hears events, by MAC. The supervisor hands out the same ones."""
+    if not bridge.get("events", {}).get("onvif"):
+        return {}
+    return {c["onvif"]["mac"].lower(): c["onvif"]["ip"] for c in bridge["cameras"]
+            if c.get("event") is not None and c["onvif"].get("mac")}
+
+
+def motion(address):
+    """What the camera itself knows: its motion, the latest detection of each kind and who listens. None without events."""
+    if not address:
+        return None
+    status, raw = camera_call(address)
+    try:
+        answer = json.loads(raw) if status == 200 else None
+    except ValueError:
+        return None
+    return answer if isinstance(answer, dict) else None
+
+
+def motion_test(req):
+    """A five-second motion of our own, to see whether the recorder hears this camera."""
+    cam = camera(read(ONVIF), req.get("id"))
+    address = motion_addresses(read(BRIDGE)).get(cam["mac"].lower())
+    before = motion(address)
+    if before is None:
+        raise Problem("Bewegingsmeldingen staan voor " + display(cam) + " niet aan. Rond eerst stap 2 van de installatie af.")
+    if not before.get("listeners"):
+        raise Problem("Geen recorder luistert naar bewegingsmeldingen van " + display(cam) +
+                      ". Adopteer de camera in UniFi Protect en probeer het daarna opnieuw.")
+    status, _ = camera_call(address, "POST", "/trigger/motion?state=test")
+    if status == 409:
+        raise Problem("Bij " + display(cam) + " is op dit moment al beweging. Kijk in Protect of die in de tijdlijn staat.")
+    if status != 200:
+        raise Problem("De virtuele camera nam de testbeweging niet aan.")
+    for _ in range(16):
+        time.sleep(0.25)
+        if (motion(address) or {}).get("delivered") != before.get("delivered"):
+            return {"delivered": True}
+    return {"delivered": False}
+
+
+def events_state(bridge):
+    """Whether the bridge can read Google's event subscription: "ok", "denied", "missing", "key" or "unreachable".
+    None while events are off or the bridge has not tried yet."""
+    if not bridge.get("events", {}).get("onvif"):
+        return None
+    try:
+        state = read(EVENTS)
+        if state["ok"]:
+            return "ok"
+        error = str(state.get("error", ""))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    code = re.search(r"HTTP (\d{3})", error)
+    if any(word in error for word in ("service account key", "private key", "oauth2")) or (code and code[1] == "401"):
+        return "key"
+    return {"403": "denied", "404": "missing"}.get(code and code[1], "unreachable")
+
+
+def sessions(state):
+    """What the bridge last said about each camera's video, by stream path: the state, since when, how often it stopped."""
+    return {"cam-" + slug(name): entry for name, entry in state.get("streams", {}).items()}
+
+
+def link_expiry():
+    """When Google ends the link by itself, as it does for an OAuth app in the test status. None for a lasting link."""
+    value = (read(SETUP) if SETUP.exists() else {}).get("link_expires")
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def google_link():
@@ -259,24 +334,28 @@ def status():
     onvif = read(ONVIF)
     state = read(STATE)
     bridge = read(BRIDGE)
-    # The same addresses the supervisor gives each camera for the motion the bridge forwards.
-    motion_ips = {c["onvif"]["mac"].lower(): c["onvif"]["ip"] for c in bridge["cameras"]
-                  if bridge.get("events", {}).get("onvif") and c.get("event") is not None and c["onvif"].get("mac")}
+    motion_ips, video = motion_addresses(bridge), sessions(state)
     def summary(cam):
         current = state["cameras"].get(cam["uuid"], {})
         addr = current.get("ip", "")
         healthy = current.get("online", False)
         profile = cam["streams"][0]
-        return {"id": cam["uuid"], "name": display(cam), "ip": addr, "online": healthy,
+        paused = bool(cam.get("paused"))
+        private = None if paused else motion_ips.get(cam["mac"].lower())
+        live = source_live(cam) if state["media"] and not paused else None
+        seen = video.get(stream_path(cam), {})
+        return {"id": cam["uuid"], "name": display(cam), "ip": addr, "online": healthy, "paused": paused,
                 "username": cam["auth"]["username"], "kind": cam.get("kind", kind_from_name(cam["name"])),
-                "model": cam["info"]["model"], "live": source_live(cam) if state["media"] else None,
-                "width": profile["width"], "height": profile["height"],
-                "motion": motion(motion_ips.get(cam["mac"].lower()))}
+                "model": cam["info"]["model"], "live": live,
+                "since": seen.get("since") if live else None, "drops": seen.get("drops", 0),
+                "width": profile["width"], "height": profile["height"], "motion": motion(private),
+                # The web process fetches the still from the camera's private listener, which it finds by this number.
+                "still": "/snapshot/" + private.rsplit(".", 1)[1] + ".jpg" if private else None}
     with ThreadPoolExecutor(max_workers=6) as pool:
         link, update = pool.submit(google_link), pool.submit(newer_version)
         cams = sorted(pool.map(summary, onvif["devices"]), key=lambda c: c["name"].casefold())
-    return {"cameras": cams, "bridge": state["bridge"], "google": link.result(),
-            "version": VERSION, "update": update.result()}
+    return {"cameras": cams, "bridge": state["bridge"], "google": link.result(), "link_expires": link_expiry(),
+            "events": events_state(bridge), "version": VERSION, "update": update.result()}
 
 
 
@@ -363,14 +442,18 @@ def add_configs(bridge, onvif, media, dev, label, password):
     return cam
 
 
+def bridge_entry(bridge, cam):
+    # The bridge publishes each camera to the path it derives from its name.
+    entries = [c for c in bridge["cameras"] if "cam-" + slug(c["name"]) == stream_path(cam)]
+    if len(entries) != 1:
+        raise Problem("De videobridge-instelling van deze camera is niet eenduidig.")
+    return entries[0]
+
+
 def remove_configs(bridge, onvif, media, cam):
     """Take one camera out of all three files. A reader left without streams goes too; publishers stay for the next camera."""
     path = stream_path(cam)
-    # The bridge publishes each camera to the path it derives from its name.
-    entries = [c for c in bridge["cameras"] if "cam-" + slug(c["name"]) == path]
-    if len(entries) != 1:
-        raise Problem("De videobridge-instelling van deze camera is niet eenduidig.")
-    bridge["cameras"].remove(entries[0])
+    bridge["cameras"].remove(bridge_entry(bridge, cam))
     onvif["devices"].remove(cam)
     media["paths"].pop(path, None)
     for user in list(media["authInternalUsers"]):
@@ -403,7 +486,7 @@ def recover():
         else:
             replace(Path(path), data)
     # A restored camera may have been offline before; waiting for it would keep every request failing.
-    cam = None if job["action"] in ("add", "remove", "restore") else camera(read(ONVIF), job["camera"]["uuid"])
+    cam = None if job["action"] in ("add", "remove", "restore", "pause") else camera(read(ONVIF), job["camera"]["uuid"])
     ready(cam)
     if job["action"] == "password":
         confirm_reader(cam, job["camera"]["auth"]["password"])
@@ -441,6 +524,19 @@ def change(action, req):
         if req.get("previous") != display(cam):
             raise Problem("De naam is intussen gewijzigd. Vernieuw het overzicht.")
         cam["display_name"] = label
+    elif action == "pause":
+        # A paused camera keeps its place in every file. The bridge and the supervisor leave it alone, so
+        # Google is not asked for its video and it is gone from the network until it is resumed.
+        cam = camera(onvif, req.get("id"))
+        label, paused = display(cam), req.get("paused") is True
+        if bool(cam.get("paused")) == paused:
+            return {"name": label, "paused": paused}
+        bridge = read(BRIDGE)
+        before[str(BRIDGE)] = copy.deepcopy(bridge)
+        for item in (cam, bridge_entry(bridge, cam)):
+            item.pop("paused", None)
+            if paused:
+                item["paused"] = True
     elif action == "remove":
         cam = camera(onvif, req.get("id"))
         label = display(cam)
@@ -463,12 +559,12 @@ def change(action, req):
         raise Problem("Er is al een camera met deze naam.")
     replace(PENDING, {"action": action, "camera": cam, "before": before})
     try:
-        if action in ("add", "remove"):
+        if action in ("add", "remove", "pause"):
             replace(BRIDGE, bridge)
         if action in ("add", "password", "remove"):
             replace(MEDIA, media)
         replace(ONVIF, onvif)
-        ready(None if action == "remove" else cam)
+        ready(None if action in ("remove", "pause") else cam)
         if action == "password":
             confirm_reader(cam, former)
         if action == "add":
@@ -482,6 +578,8 @@ def change(action, req):
     except Exception:
         recover()
         raise
+    if action == "pause":
+        return {"name": label, "paused": paused}
     return {"name": label, "removed": True} if action == "remove" else {"name": label}
 
 
@@ -610,21 +708,30 @@ def setup(action, req):
         pasted = not redirect.startswith(origin + "/")
         if state != progress["state"] and not (pasted and state is None):
             raise Problem("Deze koppeling hoort niet bij de laatste poging. Start de stap opnieuw.")
-        replace(SETUP, {k: v for k, v in progress.items() if k not in ("state", "kind")})
+        kept = {k: v for k, v in progress.items() if k not in ("state", "kind")}
+        replace(SETUP, kept)
         try:
             token = google_api.exchange(google["client_id"], google["client_secret"], redirect, code)
             if kind == "cloud":
                 key_path = BRIDGE.parent / KEY_FILE
-                known = read(key_path).get("client_email") if key_path.exists() else None
+                # A key Google no longer accepts is replaced. Otherwise the one from an earlier run stays.
+                known = (read(key_path).get("client_email")
+                         if key_path.exists() and events_state(bridge) != "key" else None)
                 made = google_api.provision(token["access_token"], google["client_id"], known)
                 if made["key"]:
                     replace(key_path, made["key"], 10001)
                 enable_events(bridge, read(ONVIF)["devices"], made["subscription"], KEY_FILE)
                 replace(BRIDGE, bridge)
-                replace(SETUP, {"topic": made["topic"]})
+                replace(SETUP, dict(kept, topic=made["topic"]))
             else:
                 if not token.get("refresh_token"):
                     raise Problem("Google gaf geen blijvende toegang. Start de koppeling opnieuw en geef toestemming.")
+                # Google only names a lifetime for a link that ends by itself: the OAuth app is in the test status.
+                lifetime = token.get("refresh_token_expires_in")
+                kept.pop("link_expires", None)
+                if isinstance(lifetime, int) and not isinstance(lifetime, bool) and lifetime > 0:
+                    kept["link_expires"] = int(time.time()) + lifetime
+                replace(SETUP, kept)
                 expiry = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + int(token.get("expires_in", 0))))
                 replace(TOKENS, {"access_token": token["access_token"], "token_type": "Bearer",
                                  "refresh_token": token["refresh_token"], "expiry": expiry}, 10001)
@@ -642,6 +749,178 @@ def setup(action, req):
     return setup_state(origin)
 
 
+def notice_settings(data):
+    """Checked webhook settings. An empty address switches the messages off."""
+    url, events = data.get("url", ""), data.get("events", [])
+    if not isinstance(url, str) or not isinstance(events, list) or not all(isinstance(k, str) and k in KINDS for k in events):
+        raise Problem("Ongeldige instellingen voor meldingen.")
+    url = url.strip()
+    if url:
+        try:
+            parts = urlsplit(url)
+            usable = parts.scheme in ("http", "https") and bool(parts.hostname)
+        except ValueError:
+            usable = False
+        if not usable or len(url) > 500 or re.search(r"[\s\x00-\x1f]", url):
+            raise Problem("Vul een webadres in dat begint met http:// of https://.")
+    return {"url": url, "events": sorted(set(events)), "health": bool(data.get("health"))}
+
+
+def notices():
+    if not NOTIFY.exists():
+        return {"url": "", "events": ["chime", "person"], "health": True}
+    try:
+        return notice_settings(read(NOTIFY))
+    except (OSError, ValueError, AttributeError, Problem):
+        return {"url": "", "events": [], "health": False}
+
+
+def send_notice(url, event, title, text, camera_name=None):
+    """One JSON message to the webhook. `text` and `content` repeat the message for services that read only those."""
+    body = {"title": title, "message": text, "event": event, "text": text, "content": text,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if camera_name:
+        body["camera"] = camera_name
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": "NestUnifi"})
+    with urllib.request.urlopen(request, timeout=6) as response:
+        response.read(1)
+
+
+def notify(action, req):
+    if action == "notifytest":
+        settings = notices()
+        if not settings["url"]:
+            raise Problem("Vul eerst een webadres in en sla het op.")
+        try:
+            send_notice(settings["url"], "test", "NestUnifi", "Dit is een testmelding van NestUnifi.")
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            code = getattr(exc, "code", None)
+            raise Problem("De testmelding is niet aangekomen" + (" (HTTP %d)" % code if isinstance(code, int) else "") +
+                          ". Controleer het webadres.")
+    elif "url" in req:
+        replace(NOTIFY, notice_settings(req))
+    return notices()
+
+
+def watch_events(state, settings, send):
+    """One look at what every camera detected. A camera's first answer only sets the baseline, so nothing old is sent."""
+    names = {c["mac"].lower(): (c["uuid"], display(c)) for c in read(ONVIF)["devices"]}
+    seen, quiet = state.setdefault("detected", {}), state.setdefault("quiet", {})
+    for mac, address in motion_addresses(read(BRIDGE)).items():
+        camera_id, name = names.get(mac, (None, None))
+        current = (motion(address) or {}).get("detected")
+        if camera_id is None or not isinstance(current, dict):
+            continue
+        known, seen[camera_id] = seen.get(camera_id), current
+        for kind, stamp in current.items() if known is not None else ():
+            # Google repeats a detection while it lasts. One message per half minute is enough.
+            if kind in settings["events"] and known.get(kind) != stamp and time.monotonic() >= quiet.get((camera_id, kind), 0):
+                quiet[camera_id, kind] = time.monotonic() + 30
+                send(kind, name, KINDS[kind] % name, name)
+
+
+def health_problems():
+    """What is wrong right now: for each problem the message, and the message for when it is over."""
+    problems, bridge, link = {}, read(BRIDGE), google_link()
+    if link in ("revoked", "client"):
+        problems["google"] = ("Google accepteert de koppeling van NestUnifi niet meer. De camera's krijgen geen beeld. "
+                              "Open de beheerpagina om de koppeling te herstellen.", "De koppeling met Google werkt weer.")
+    expires = link_expiry()
+    if link == "ok" and expires and 0 < expires - time.time() < 2 * 86400:
+        problems["expiring"] = ("De koppeling met Google verloopt binnen twee dagen, omdat de inlog-app in Google Cloud nog "
+                                "op Testing staat. Kies daar Publish app en koppel daarna opnieuw op de beheerpagina.", None)
+    if events_state(bridge) in ("denied", "missing", "key"):
+        problems["events"] = ("NestUnifi kan het meldingskanaal van Google niet lezen. Bewegingen komen niet aan in Protect. "
+                              "Open de beheerpagina om het te herstellen.", "Het meldingskanaal van Google werkt weer.")
+    state = read(STATE)
+    video = sessions(state)
+    for cam in read(ONVIF)["devices"]:
+        if cam.get("paused"):
+            continue
+        # The bridge names a state for every camera it runs. Anything but video counts once it lasts.
+        if (not state["cameras"].get(cam["uuid"], {}).get("online")
+                or video.get(stream_path(cam), {}).get("state") not in (None, "live", "renewing")):
+            problems["camera:" + cam["uuid"]] = (display(cam) + " geeft geen beeld.", display(cam) + " geeft weer beeld.")
+    update = newer_version()
+    if update:
+        problems["update:" + update] = ("NestUnifi %s is beschikbaar. Draai sh install.sh opnieuw om bij te werken." % update, None)
+    return problems
+
+
+def watch_health(state, problems, send, now):
+    """Report each problem once it has lasted, and report its end."""
+    seen = state.setdefault("problems", {})
+    for key, (text, _) in problems.items():
+        entry = seen.setdefault(key, {"since": now, "reported": False})
+        entry["over"] = problems[key][1]
+        if not entry["reported"] and now - entry["since"] >= HOLD:
+            entry["reported"] = True
+            send("problem", "NestUnifi", text)
+    for key in seen.keys() - problems.keys():
+        entry = seen.pop(key)
+        if entry["reported"] and entry["over"]:
+            send("resolved", "NestUnifi", entry["over"])
+
+
+def watch():
+    """Runs beside the request handler and turns detections and problems into webhook messages."""
+    state, checked, failure = {}, 0.0, None
+    while True:
+        time.sleep(2)
+        try:
+            settings = notices()
+            def send(event, title, text, camera_name=None):
+                try:
+                    if settings["url"]:
+                        send_notice(settings["url"], event, title, text, camera_name)
+                except (OSError, ValueError, http.client.HTTPException):
+                    print("NestUnifi: de webhook nam een melding niet aan", file=sys.stderr)
+            watch_events(state, settings, send)
+            if not (settings["url"] and settings["health"]):
+                state.pop("problems", None)
+            elif STATE.exists() and time.monotonic() - checked >= 60:
+                checked = time.monotonic()
+                watch_health(state, health_problems(), send, checked)
+            failure = None
+        except Exception as exc:
+            if type(exc) is not failure:  # Once per kind of failure, not every two seconds.
+                print("NestUnifi meldingen:", type(exc).__name__, file=sys.stderr)
+            failure = type(exc)
+
+
+def diagnose():
+    """What someone who helps needs to see: versions, states and the latest log lines. Passwords, keys, tokens and the
+    webhook address stay out, also where a service printed one."""
+    bridge, media, state = read(BRIDGE), read(MEDIA), status()
+    hidden = {bridge["google"].get("client_secret"), media.get("hlsCDNSecret"), notices()["url"],
+              urlsplit(bridge["media"]["rtsp_base_url"]).password}
+    hidden.update(u.get("pass") for u in media["authInternalUsers"])
+    hidden.update(c["auth"].get("password") for c in read(ONVIF)["devices"])
+    for path in (TOKENS, BRIDGE.parent / KEY_FILE):
+        if path.exists():
+            hidden.update(v for k, v in read(path).items() if k in ("access_token", "refresh_token", "private_key", "private_key_id"))
+    hidden = sorted((s for s in hidden if isinstance(s, str) and len(s) >= 6), key=len, reverse=True)
+    lines = []
+    for path in (LOG.with_suffix(".old"), LOG):
+        if path.exists():
+            lines += path.read_text(errors="replace").splitlines()
+    log = []
+    for line in lines[-300:]:
+        for secret in hidden:
+            line = line.replace(secret, "***")
+        log.append(re.sub(r"://[^/@\s]+@", "://***@", line)[:300])
+    setup_now = setup_state("")
+    supervisor = read(STATE)
+    return {"nestunifi": "diagnose", "version": VERSION, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "services": {k: supervisor.get(k) for k in ("bridge", "idle", "media", "web")},
+            "google": state["google"], "link_expires": state["link_expires"], "events": state["events"],
+            "update": state["update"], "setup": {k: setup_now[k] for k in ("client", "cloud", "linked", "cameras")},
+            "notify": {"on": bool(notices()["url"]), "events": notices()["events"], "health": notices()["health"]},
+            "cameras": [{k: v for k, v in cam.items() if k not in ("id", "username", "still")} for cam in state["cameras"]],
+            "log": log}
+
+
 def backup():
     """Everything needed to move to another system, Google link included. The admin password stays behind."""
     return {"nestunifi": 1, "version": VERSION,
@@ -656,7 +935,8 @@ def restored(files):
     base = urlsplit(bridge["media"]["rtsp_base_url"])
     cameras = [dict({"device_id": c["device_id"], "name": c["name"], "audio": bool(c.get("audio")),
                      "onvif": {"ip": c["onvif"]["ip"], "mac": c["onvif"]["mac"]}},
-                    **({"event": {"linger": c["event"].get("linger", "60s")}} if c.get("event") is not None else {}))
+                    **({"event": {"linger": c["event"].get("linger", "60s")}} if c.get("event") is not None else {}),
+                    **({"paused": True} if c.get("paused") is True else {}))
                for c in bridge["cameras"]]
     users = [dict({"user": u["user"], "pass": u["pass"],
                    "permissions": [{"action": r["action"], "path": r["path"]} for r in u["permissions"]]},
@@ -673,6 +953,7 @@ def restored(files):
             or not all(text(u["user"], u["pass"], *u.get("ips", [])) and all(r["action"] in ("read", "publish") and text(r["path"])
                                                          for r in u["permissions"]) for u in users)
             or not all(re.fullmatch(r"cam-[a-z0-9-]+", path) for path in paths)
+            or not all(c.get("paused", True) is True for c in devices)
             or {stream_path(c) for c in devices} != published or not published <= paths.keys()):
         raise TypeError
     return (dict(read(BRIDGE), google=google, media={"rtsp_base_url": base.geturl()}, cameras=cameras,
@@ -693,6 +974,8 @@ def restore(req):
         if not all(isinstance(f, dict) for f in files.values()):
             raise TypeError
         files = dict(files, **dict(zip(("bridge/config.yaml", "media/mediamtx.yml", "onvif/config.yaml"), restored(files))))
+        if "admin/notify.json" in files:
+            files["admin/notify.json"] = notice_settings(files["admin/notify.json"])
     except (KeyError, TypeError, AttributeError, ValueError, Problem):
         raise Problem("Deze back-up is onvolledig of beschadigd.")
     replace(PENDING, {"action": "restore", "camera": None,
@@ -765,10 +1048,16 @@ def dispatch(req):
             raise Problem("De bridge ontvangt geen video van " + display(cam) +
                           ". Controleer het livebeeld in Google Home en probeer het opnieuw.")
         return {"url": "/live/" + stream_path(cam) + "/index.m3u8"}
-    if action in ("add", "rename", "profile", "password", "remove"):
+    if action in ("add", "rename", "profile", "password", "remove", "pause"):
         return change(action, req)
+    if action == "diagnose":
+        return diagnose()
     if action in ("setup", "client", "project", "consent", "code"):
         return setup(action, req)
+    if action == "motiontest":
+        return motion_test(req)
+    if action in ("notify", "notifytest"):
+        return notify(action, req)
     if action == "backup":
         return backup()
     if action == "restore":
@@ -803,6 +1092,7 @@ if __name__ == "__main__":
     CONTROL.parent.mkdir(mode=0o711, exist_ok=True)
     CONTROL.parent.chmod(0o711)
     CONTROL.unlink(missing_ok=True)
+    threading.Thread(target=watch, daemon=True).start()
     with socketserver.UnixStreamServer(str(CONTROL), Request) as server:
         os.chown(CONTROL, 10004, 10004)
         os.chmod(CONTROL, 0o600)

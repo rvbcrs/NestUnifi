@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Aiaid/onvif-proxy/internal/soap"
@@ -24,6 +25,7 @@ const concreteSet = "http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet"
 const maxPullPoints = 16
 const queueLimit = 192
 const subscriptionLife = 5 * time.Minute
+const testMotion = 5 * time.Second
 const eventCaps = `<tev:Capabilities WSPullPointSupport="true" WSSubscriptionPolicySupport="false" WSPausableSubscriptionManagerInterfaceSupport="false" MaxPullPoints="16" PersistentNotificationStorage="false"/>`
 
 type motionTopic struct{ path, field, rule string }
@@ -81,43 +83,117 @@ func (p *pullPoint) enqueue(active bool, at time.Time, operation string) {
 }
 
 type eventState struct {
-	mu      sync.Mutex
-	active  bool
-	since   time.Time // start of the latest motion, for the admin page
-	points  map[string]*pullPoint
-	changed chan struct{}
+	mu        sync.Mutex
+	active    bool
+	testing   bool                 // the motion is the admin page's test, not a detection
+	since     time.Time            // start of the latest motion, for the admin page
+	detected  map[string]time.Time // latest detection of each kind, as the bridge reports them
+	delivered time.Time            // latest moment a subscriber fetched a change
+	viewers   atomic.Int32         // open connections to the video stream
+	points    map[string]*pullPoint
+	changed   chan struct{}
 }
 
 func (e *eventState) wake() { close(e.changed); e.changed = make(chan struct{}) }
 
+// set changes the motion level and queues the change for every subscriber. The caller holds mu.
+func (e *eventState) set(active bool, now time.Time) {
+	if e.active == active {
+		return
+	}
+	e.active = active
+	for _, p := range e.points {
+		if now.Before(p.expires) {
+			p.enqueue(active, now, "Changed")
+		}
+	}
+	e.wake()
+}
+
+// Watched counts the connections accepted on the video listener, so the admin page can tell whether a
+// recorder is watching.
+func (s *Server) Watched(ln net.Listener) net.Listener {
+	return &watched{Listener: ln, open: &s.events.viewers}
+}
+
+type watched struct {
+	net.Listener
+	open *atomic.Int32
+}
+
+func (l *watched) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.open.Add(1)
+	return &viewer{Conn: conn, open: l.open}, nil
+}
+
+type viewer struct {
+	net.Conn
+	open *atomic.Int32
+	once sync.Once
+}
+
+func (c *viewer) Close() error {
+	c.once.Do(func() { c.open.Add(-1) })
+	return c.Conn.Close()
+}
+
 func (s *Server) ServeTrigger(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /trigger/motion", func(w http.ResponseWriter, r *http.Request) {
-		var active bool
+		e := &s.events
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		now := time.Now()
 		switch r.URL.Query().Get("state") {
 		case "on", "true":
-			active = true
+			if !e.active || e.testing {
+				e.since = now
+			}
+			e.testing = false
+			e.set(true, now)
 		case "off", "false":
+			e.testing = false
+			e.set(false, now)
+		case "test":
+			// A short motion of the admin page's own, to see whether the recorder hears this camera.
+			if e.active {
+				http.Error(w, "motion already active", http.StatusConflict)
+				return
+			}
+			e.testing = true
+			e.set(true, now)
+			time.AfterFunc(testMotion, func() {
+				e.mu.Lock()
+				defer e.mu.Unlock()
+				if e.testing { // a real detection since then ends on its own
+					e.testing = false
+					e.set(false, time.Now())
+				}
+			})
 		default:
 			http.Error(w, "invalid state", 400)
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+	})
+	// The motion level stays up while detections follow each other. The bridge names each one here.
+	mux.HandleFunc("POST /trigger/event", func(w http.ResponseWriter, r *http.Request) {
+		kind := r.URL.Query().Get("kind")
+		if kind != "motion" && kind != "person" && kind != "chime" {
+			http.Error(w, "invalid kind", 400)
+			return
+		}
 		e := &s.events
 		e.mu.Lock()
-		defer e.mu.Unlock()
-		if e.active != active {
-			e.active = active
-			now := time.Now()
-			if active {
-				e.since = now
-			}
-			for _, p := range e.points {
-				if now.Before(p.expires) {
-					p.enqueue(active, now, "Changed")
-				}
-			}
-			e.wake()
+		if e.detected == nil {
+			e.detected = make(map[string]time.Time)
 		}
+		e.detected[kind] = time.Now()
+		e.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
 	// Only processes inside the container reach this loopback listener. The admin page reads it.
@@ -125,15 +201,45 @@ func (s *Server) ServeTrigger(ctx context.Context, ln net.Listener) error {
 		e := &s.events
 		e.mu.Lock()
 		state := struct {
-			Active bool   `json:"active"`
-			Last   string `json:"last"`
-		}{Active: e.active}
+			Active    bool              `json:"active"`
+			Last      string            `json:"last"`
+			Detected  map[string]string `json:"detected"`
+			Listeners int               `json:"listeners"` // recorders subscribed to this camera's motion
+			Delivered string            `json:"delivered"`
+			Viewers   int32             `json:"viewers"`
+		}{Active: e.active, Detected: make(map[string]string), Viewers: e.viewers.Load()}
 		if !e.since.IsZero() {
 			state.Last = stamp(e.since)
+		}
+		for kind, at := range e.detected {
+			state.Detected[kind] = stamp(at)
+		}
+		now := time.Now()
+		for _, p := range e.points {
+			if now.Before(p.expires) {
+				state.Listeners++
+			}
+		}
+		if !e.delivered.IsZero() {
+			state.Delivered = stamp(e.delivered)
 		}
 		e.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(state)
+	})
+	// A still for the admin page's overview, without the camera's password: this listener is private.
+	mux.HandleFunc("GET /trigger/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if s.opts.SnapshotFunc == nil {
+			http.Error(w, "snapshot not available", http.StatusServiceUnavailable)
+			return
+		}
+		data, kind, err := s.opts.SnapshotFunc(r.Context(), "")
+		if err != nil {
+			http.Error(w, "snapshot source unavailable", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", kind)
+		_, _ = w.Write(data)
 	})
 	srv := s.httpServer()
 	srv.Handler = mux
@@ -295,6 +401,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			n := min(limit, len(p.queue))
 			body = "<tev:PullMessagesResponse>" + times("tev") + strings.Join(p.queue[:n], "") + "</tev:PullMessagesResponse>"
 			if strings.Contains(body, `PropertyOperation="Changed"`) {
+				e.delivered = time.Now()
 				log.Printf("ONVIF events: motion delivered camera=%q peer=%s", s.dev.Name, r.RemoteAddr)
 			}
 			p.queue = p.queue[n:]

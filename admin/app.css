@@ -259,6 +259,18 @@ h2 {
   background: linear-gradient(125deg, #c2aedf14, #b3d3fd0a);
   box-shadow: inset 0 1px 0 #ffffff06;
 }
+.device .still {
+  aspect-ratio: 16/9;
+  overflow: hidden;
+  border-radius: 18px 18px 0 0;
+  background: #0c0b14;
+}
+.device .still img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
 .device:hover,
 .device:focus-within {
   border-color: #aa8ac5;
@@ -460,9 +472,15 @@ select:focus {
 .backup h2 {
   font-size: 18px;
 }
+.backup h2:not(:first-child) {
+  margin-top: 22px;
+}
 .backup p {
   color: var(--muted);
   font-size: 14px;
+}
+.backup .pick {
+  font-weight: 400;
 }
 .primary.danger {
   background: #a3324a;

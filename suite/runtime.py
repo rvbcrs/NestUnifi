@@ -6,6 +6,8 @@ import re
 import signal
 import socket
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,7 +19,16 @@ BRIDGE = Path("/config/config.yaml")
 TOKENS = Path("/config/tokens.json")
 MEDIA = Path("/media-config/mediamtx.yml")
 STATUS = Path("/run/suite-status.json")
+# The bridge writes here whether it can read Google's event subscription. The admin page shows it.
+EVENTS = Path("/run/bridge/events.json")
 LEASES = Path("/run/leases")
+# The latest output of every service, for the diagnostics download. Two files of at most 128 KB, in memory.
+LOG = Path("/run/suite-log.txt")
+log_lock = threading.Lock()
+# What the bridge prints when a camera's video session changes. "live" and "renewing" mean there is video.
+SESSION = re.compile(r'session state changed camera=(?:"([^"]*)"|(\S+)) state=(\w+)')
+VIDEO = ("live", "renewing")
+sessions = {}  # Per camera, by its name in the bridge: the state, since when there is video, how often it stopped.
 GROUP = "239.255.255.250"
 stopping = False
 
@@ -41,8 +52,48 @@ def stop(proc):
             proc.wait()
 
 
-def spawn(args, uid, **opts):
-    return subprocess.Popen(args, user=uid, group=uid, extra_groups=[], **opts)
+def keep(line):
+    with log_lock:
+        if LOG.exists() and LOG.stat().st_size > 128 * 1024:
+            LOG.replace(LOG.with_suffix(".old"))
+        with open(os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "w") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line)
+
+
+def session(line):
+    """Follow each camera's video from what the bridge says about it. The admin page shows it."""
+    found = SESSION.search(line)
+    if found:
+        entry = sessions.setdefault(found[1] or found[2], {"state": None, "since": None, "drops": 0})
+        had, has = entry["state"] in VIDEO, found[3] in VIDEO
+        if has and not had:
+            entry["since"] = int(time.time())
+        if had and not has:
+            entry["drops"] += 1
+        entry["state"] = found[3]
+
+
+def follow(proc, heard=None):
+    """Pass a service's output on to the container log and keep the latest lines."""
+    def run():
+        with proc.stdout:
+            for line in proc.stdout:
+                try:  # Whatever happens here, keep reading: a full pipe would stop the service.
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    keep(line)
+                    if heard:
+                        heard(line)
+                except (OSError, ValueError):
+                    pass
+    threading.Thread(target=run, daemon=True).start()
+    return proc
+
+
+def spawn(args, uid=None, heard=None, **opts):
+    identity = {} if uid is None else {"user": uid, "group": uid, "extra_groups": []}
+    return follow(subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+                                   **identity, **opts), heard)
 
 
 def ip(*args):
@@ -103,6 +154,7 @@ def remember(mac, address):
 def device_config(cam):
     device = cam.copy()
     device.pop("kind", None)
+    device.pop("paused", None)
     name = device.pop("display_name", cam["name"])
     device.update(name=name, ports={"soap": 80, "rtsp": 554})
     return {"server": {"discovery": True}, "web": {"enabled": False}, "devices": [device]}
@@ -186,6 +238,8 @@ def loop():
     LEASES.mkdir(mode=0o700, exist_ok=True)
     Path("/run/endpoints").mkdir(mode=0o711, exist_ok=True)
     Path("/run/endpoints").chmod(0o711)
+    EVENTS.parent.mkdir(mode=0o700, exist_ok=True)
+    os.chown(EVENTS.parent, 10001, 10001)
     bridge = media = web = worker = None
     cams = {}
     prior_status = prior_source = bridge_version = None
@@ -195,7 +249,7 @@ def loop():
         while not stopping:
             # The worker writes the configuration of a new installation before anything else can start.
             if worker is None or worker.poll() is not None:
-                worker = subprocess.Popen(["python3", "-IB", "/app/worker.py"])
+                worker = spawn(["python3", "-IB", "/app/worker.py"])
             if not (BRIDGE.exists() and MEDIA.exists() and SOURCE.exists()):
                 time.sleep(1)
                 continue
@@ -205,13 +259,16 @@ def loop():
             version = BRIDGE.stat().st_mtime_ns
             bridge_changed = version != bridge_version
             if bridge_changed:
-                cameras = len(json.loads(BRIDGE.read_bytes())["cameras"])
+                cameras = sum(not c.get("paused") for c in json.loads(BRIDGE.read_bytes())["cameras"])
                 bridge_version = version
-            # The bridge exits without a Google link or a camera. Until the wizard is done there is nothing to run.
+            # The bridge exits without a Google link or a camera that is not paused. Until then there is nothing to run.
             idle = not cameras or not TOKENS.exists()
             if idle or bridge_changed or bridge is None or bridge.poll() is not None:
                 stop(bridge)
-                bridge = None if idle else spawn(["nest-bridge", "-config=/config/config.yaml", "-tokens=/config/tokens.json", "serve"], 10001)
+                EVENTS.unlink(missing_ok=True)  # What the previous bridge knew says nothing about the next one.
+                sessions.clear()
+                bridge = None if idle else spawn(["nest-bridge", "-config=/config/config.yaml", "-tokens=/config/tokens.json", "serve"],
+                                                 10001, session, env=dict(os.environ, NEST_EVENTS_STATUS=str(EVENTS)))
             if web is None or web.poll() is not None:
                 # Only the admin page is reachable from outside, on the network Docker publishes the port from.
                 web = spawn(["python3","-IB","/app/web.py"], 10004, env=dict(
@@ -219,7 +276,7 @@ def loop():
                     NESTUNIFI_HLS_KEY=json.loads(MEDIA.read_bytes()).get("hlsCDNSecret", "")))
             raw = SOURCE.read_bytes()
             if raw != prior_source or bridge_changed:
-                devices = {c["uuid"]:c for c in json.loads(raw)["devices"]}
+                devices = {c["uuid"]:c for c in json.loads(raw)["devices"] if not c.get("paused")}
                 config = json.loads(BRIDGE.read_bytes())
                 motion_ips = {c["onvif"]["mac"].lower(): c["onvif"]["ip"] for c in config["cameras"]
                               if config.get("events", {}).get("onvif") and c.get("event") is not None}
@@ -240,7 +297,8 @@ def loop():
                     print("Camera", endpoint.hostname, type(e).__name__, flush=True)
             status = {"revision":hashlib.sha256(raw).hexdigest(), "bridge":bridge is not None and bridge.poll() is None,
                       "idle":idle, "media":media.poll() is None, "web":web.poll() is None, "bridge_version":bridge_version,
-                      "cameras":{k:{"online":c.online, "ip":c.address} for k,c in cams.items()}}
+                      "cameras":{k:{"online":c.online, "ip":c.address} for k,c in cams.items()},
+                      "streams":{name:dict(entry) for name, entry in list(sessions.items())}}
             if status != prior_status:
                 atomic(STATUS, json.dumps(status))
                 prior_status = status

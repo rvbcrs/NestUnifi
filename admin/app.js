@@ -36,7 +36,7 @@ function icon(name) {
   img.alt = "";
   return img;
 }
-let devices = [], filter = "";
+let devices = [], filter = "", stills = 0;
 // The time of a camera's latest motion, short when it was today.
 function when(stamp) {
   const at = new Date(stamp);
@@ -48,7 +48,7 @@ function motionText(motion) {
   return !motion ? "" : motion.active ? "beweging nu" : motion.last ? "beweging " + when(motion.last) : "";
 }
 function renderDevices() {
-  const list = el("devices");
+  const list = el("devices"), withStills = devices.some(c => c.still && c.live);
   list.replaceChildren();
   for (const cam of devices.filter(c => !filter || c.kind === filter)) {
     const row = make("article", undefined, "device");
@@ -64,7 +64,7 @@ function renderDevices() {
     open.className = "stream-link";
     open.setAttribute("aria-label", "Livebeeld van " + cam.name);
     const footer = make("div", undefined, "device-footer");
-    const liveStatus = cam.live === null ? "Beeldstatus onbekend" : cam.live ? "Livebeeld beschikbaar" : "Geen bronbeeld";
+    const liveStatus = cam.paused ? "Gepauzeerd" : cam.live === null ? "Beeldstatus onbekend" : cam.live ? "Livebeeld beschikbaar" : "Geen bronbeeld";
     const status = make("span", liveStatus, "status" + (cam.live ? " online" : ""));
     status.title = cam.online ? "ONVIF actief" : "ONVIF offline";
     const play = make("span", undefined, "play-hint");
@@ -76,6 +76,19 @@ function renderDevices() {
     setup.append(icon("gear-six"));
     footer.append(status, play, setup);
     row.append(open, head, footer);
+    if (withStills) {
+      // The camera's latest image. A camera without one gets the empty frame, so every card is as tall.
+      const frame = make("div", undefined, "still");
+      if (cam.still && cam.live) {
+        const still = make("img");
+        still.alt = "";
+        still.loading = "lazy";
+        still.onerror = () => still.remove();
+        still.src = cam.still + "?" + stills;
+        frame.append(still);
+      }
+      row.prepend(frame);
+    }
     list.append(row);
   }
   for (const btn of el("filters").children) btn.setAttribute("aria-pressed", String(btn.value === filter));
@@ -86,17 +99,31 @@ const linkProblems = {
   client: ["Google weigert de inlog-app van NestUnifi. Misschien is de OAuth-client verwijderd of het clientgeheim vernieuwd. Vul de gegevens opnieuw in bij stap 1 en koppel daarna opnieuw in stap 4.", "Inlog-app bijwerken", 0],
   unreachable: ["NestUnifi kon de Google-koppeling niet controleren. Controleer de internetverbinding van dit systeem.", "", null]
 };
+// What the bridge reports about Google's event subscription. Connecting Google Cloud again repairs each of them.
+const eventProblems = {
+  denied: ["Google weigert NestUnifi de toegang tot het meldingskanaal. Beweging en aanbellen komen daardoor niet aan in Protect. Verbind Google Cloud opnieuw in stap 2 van de installatie.", "Opnieuw verbinden", 1],
+  missing: ["Het meldingskanaal bestaat niet meer in je Google Cloud-project. Beweging en aanbellen komen daardoor niet aan in Protect. Verbind Google Cloud opnieuw in stap 2 van de installatie; NestUnifi maakt het kanaal dan opnieuw aan.", "Opnieuw verbinden", 1],
+  key: ["Google accepteert de sleutel van NestUnifi voor het meldingskanaal niet meer. Beweging en aanbellen komen daardoor niet aan in Protect. Verbind Google Cloud opnieuw in stap 2 van de installatie; NestUnifi haalt dan een nieuwe sleutel op.", "Opnieuw verbinden", 1]
+};
+// The one thing that most needs attention: a broken link first, then one that is about to end, then missing events.
+function attention({google, link_expires, events}) {
+  if (linkProblems[google]) return linkProblems[google];
+  if (link_expires * 1000 > Date.now()) return ["De koppeling met Google verloopt op " + when(link_expires * 1000) + ", omdat de inlog-app in Google Cloud nog op Testing staat. Kies daar Publish app, zoals in stap 1 staat, en koppel daarna opnieuw in stap 4.", "Naar stap 1", 0];
+  return eventProblems[events];
+}
 let repairStep = null;
-function render({cameras, bridge, google, version, update}) {
+function render(state) {
+  const {cameras, bridge, version, update} = state;
   el("update").hidden = !update;
   el("update").textContent = update ? "Versie " + update + " is beschikbaar. Draai sh install.sh opnieuw op dit systeem om bij te werken. Je instellingen blijven staan." : "";
-  const problem = linkProblems[google];
+  const problem = attention(state);
   el("health").hidden = !problem;
   if (problem) {
     [el("healthText").textContent, el("healthFix").textContent, repairStep] = problem;
     el("healthFix").hidden = repairStep === null;
   }
   devices = cameras;
+  stills = Date.now();  // A new number makes the browser fetch every still again.
   if (!devices.some(c => c.kind === filter)) filter = "";
   const filters = el("filters");
   filters.replaceChildren();
@@ -224,12 +251,20 @@ async function watch(cam, reconnect = true) {
 }
 function settings(cam) {
   modal(cam.name);
+  if (cam.paused) el("fields").append(make("p", "Deze camera is gepauzeerd. NestUnifi vraagt Google geen beeld van haar en ze is niet zichtbaar in je netwerk."));
+  if (cam.since) el("fields").append(make("p", "Beeld sinds " + when(cam.since * 1000) + (cam.drops ? " · " + cam.drops + (cam.drops === 1 ? " onderbreking" : " onderbrekingen") + " sinds NestUnifi startte." : " zonder onderbreking.")));
+  if (cam.motion) el("fields").append(make("p", cam.motion.viewers && cam.motion.listeners ? "Een recorder haalt het beeld op en luistert naar bewegingsmeldingen."
+    : cam.motion.viewers ? "Een recorder haalt het beeld op, maar luistert niet naar bewegingsmeldingen."
+    : cam.motion.listeners ? "Een recorder luistert naar bewegingsmeldingen, maar haalt het beeld nu niet op."
+    : "Geen recorder haalt het beeld op of luistert naar bewegingsmeldingen. UniFi Protect doet beide zodra je de camera adopteert."));
   // Without Pub/Sub events the camera reports no motion at all.
   if (cam.motion) el("fields").append(make("p", cam.motion.active ? "Beweging gemeld op dit moment."
     : cam.motion.last ? "Laatste beweging: " + when(cam.motion.last) + "."
     : "Sinds deze virtuele camera startte, kwam er nog geen beweging binnen. Ziet Google Home wel beweging? Controleer dan in stap 3 van de installatie of het Pub/Sub-topic in je Device Access-project staat."));
-  for (const [title, symbol, action] of [["Naam wijzigen", "pencil-simple", rename],
-      ["Wachtwoord wijzigen", "key", rotate], ["Stream testen", "waveform", test], ["Verwijderen", "x", removeCamera]]) {
+  for (const [title, symbol, action] of [["Naam wijzigen", "pencil-simple", rename], ["Wachtwoord wijzigen", "key", rotate],
+      ...(cam.paused ? [["Hervatten", "play", pause]] : [["Stream testen", "waveform", test],
+        ...(cam.motion ? [["Testbeweging sturen", "broadcast", motionTest]] : []), ["Pauzeren", "pause", pause]]),
+      ["Verwijderen", "x", removeCamera]]) {
     const btn = button(title, () => action(cam));
     btn.className = "action-option";
     btn.prepend(icon(symbol));
@@ -273,6 +308,14 @@ function rename(cam) {
   field.select();
   onSubmit("Opslaan", () => api("rename", {id: cam.id, name: field.value, previous: cam.name}));
 }
+function pause(cam) {
+  modal(cam.paused ? "Camera hervatten" : "Camera pauzeren");
+  el("fields").append(make("strong", cam.name), make("p", cam.paused
+    ? "NestUnifi vraagt Google weer om het beeld van deze camera en zet haar terug in je netwerk, met hetzelfde adres en wachtwoord. Protect vindt haar vanzelf terug."
+    : "NestUnifi vraagt Google dan geen beeld meer van deze camera en haalt haar uit je netwerk. In Protect staat ze als offline tot je haar hervat. Naam, adres en wachtwoord blijven bewaard."),
+    make("p", "De gedeelde videobridge herstart kort, dus de andere camera’s haperen even."));
+  onSubmit(cam.paused ? "Hervatten" : "Pauzeren", () => api("pause", {id: cam.id, paused: !cam.paused}));
+}
 function removeCamera(cam) {
   modal("Apparaat verwijderen");
   el("fields").append(make("strong", cam.name),
@@ -293,6 +336,19 @@ async function test(cam) {
       el("fields").append(make("p", "Het ONVIF-profiel vermeldt " + cam.width + " × " + cam.height + ". Overnemen werkt de profielresolutie bij en herstart dit apparaat kort."));
       onSubmit("Resolutie overnemen", () => api("profile", {id: cam.id}));
     }
+  } catch (e) { if (epoch === modalEpoch) message("modalMessage", e.message, true); }
+}
+// Five seconds of motion of our own. It shows whether the recorder hears this camera, apart from Google.
+async function motionTest(cam) {
+  const epoch = modal("Testbeweging");
+  el("fields").append(make("strong", cam.name), make("p", "NestUnifi meldt vijf seconden beweging bij deze camera, zonder tussenkomst van Google. Zo zie je of UniFi Protect de meldingen van deze camera ontvangt."));
+  message("modalMessage", "Testbeweging versturen…");
+  try {
+    const {delivered} = await api("motiontest", {id: cam.id});
+    if (epoch !== modalEpoch) return;
+    message("modalMessage", delivered
+      ? "De recorder heeft de testbeweging opgehaald. Ze hoort nu in de tijdlijn van deze camera in Protect te staan. Komen echte bewegingen niet aan? Dan ligt het aan het meldingskanaal van Google: loop stap 2 en 3 van de installatie na."
+      : "De testbeweging is verstuurd, maar de recorder heeft haar niet binnen vier seconden opgehaald. Kijk over een minuut in de tijdlijn van Protect.", !delivered);
   } catch (e) { if (epoch === modalEpoch) message("modalMessage", e.message, true); }
 }
 async function find() {
@@ -327,7 +383,8 @@ el("dialogForm").onsubmit = async e => {
   try {
     const result = await submitAction();
     el("modal").close();
-    message("notice", result.already ? "Dit apparaat is al toegevoegd." : (result.removed ? "Verwijderd · " : "Opgeslagen · ") + result.name);
+    message("notice", result.already ? "Dit apparaat is al toegevoegd."
+      : (result.removed ? "Verwijderd · " : result.paused ? "Gepauzeerd · " : result.paused === false ? "Hervat · " : "Opgeslagen · ") + result.name);
     await refresh().catch(err => message("notice", err.message, true));
   } catch (err) { message("modalMessage", err.message, true); }
   finally { el("submit").disabled = el("close").disabled = el("cancel").disabled = false; }
@@ -555,6 +612,42 @@ function renderSetup(note) {
   });
   el("setupClose").hidden = !(s.linked && s.cameras);
   renderBackup(s);
+  renderNotify(s);
+}
+// Messages to a webhook of the owner's own. Built once, so typing survives opening and closing the steps above.
+function renderNotify(s) {
+  const box = el("notify");
+  box.hidden = !(s.linked && s.cameras);
+  if (box.hidden || box.firstChild) return;
+  const form = make("form"), [label, url] = entry("notifyUrl", "Webadres van je webhook", "url"), note = make("p", undefined, "message");
+  url.required = false;
+  url.placeholder = "https://";
+  note.setAttribute("role", "status");
+  const checks = [["chime", "Aanbellen"], ["person", "Persoon gezien"], ["motion", "Beweging"], ["health", "Storingen en nieuwe versies"]].map(([value, title]) => {
+    const row = make("label", undefined, "pick"), check = make("input");
+    check.type = "checkbox";
+    check.value = value;
+    row.append(check, title);
+    return row;
+  });
+  const chosen = () => checks.map(row => row.firstChild).filter(check => check.checked).map(check => check.value);
+  const fill = settings => {
+    url.value = settings.url;
+    for (const row of checks) row.firstChild.checked = row.firstChild.value === "health" ? settings.health : settings.events.includes(row.firstChild.value);
+  };
+  const save = async () => fill(await api("notify", {url: url.value, events: chosen().filter(v => v !== "health"), health: chosen().includes("health")}));
+  const row = submit("Opslaan"), tryOut = button("Opslaan en testen", () => {
+    if (form.reportValidity()) act(form, "Testmelding versturen…", async status => { await save(); await api("notifytest"); status.textContent = "Testmelding verstuurd."; });
+  });
+  tryOut.className = "quiet";
+  row.prepend(tryOut);
+  form.onsubmit = e => {
+    e.preventDefault();
+    act(form, "Opslaan…", async status => { await save(); status.textContent = url.value ? "Opgeslagen." : "Opgeslagen. Meldingen staan uit."; });
+  };
+  form.append(label, url, ...checks, row, note);
+  box.append(make("h2", "Meldingen"), make("p", "UniFi Protect kent van deze camera’s alleen beweging. Wil je ook weten wanneer er wordt aangebeld of wanneer er iets hapert, vul dan het adres van een webhook in, bijvoorbeeld van een automatisering in Home Assistant. NestUnifi stuurt er per gebeurtenis een JSON-bericht naartoe met de velden title, message, event, camera en time. Laat het adres leeg om meldingen uit te zetten."), form);
+  act(form, "Instellingen laden…", async () => fill(await api("notify")));
 }
 // A new installation can take over a backup. Any other one can make one.
 function renderBackup(s) {
@@ -590,23 +683,30 @@ function renderBackup(s) {
     box.append(make("h2", "Verhuizen"), make("p", "Draaide NestUnifi eerder op een ander systeem? Zet het daar eerst uit, want beide zouden dezelfde netwerkadressen gebruiken. Zet daarna hier de back-up terug; de stappen hierboven zijn dan niet meer nodig."), pick, file, note);
     return;
   }
-  const save = button("Back-up downloaden", async () => {
-    save.disabled = true;
-    note.classList.remove("error");
-    note.textContent = "";
-    try {
-      const link = make("a");
-      link.href = URL.createObjectURL(new Blob([JSON.stringify(await api("backup"), null, 2)], {type: "application/json"}));
-      link.download = "nestunifi-backup-" + new Date().toISOString().slice(0, 10) + ".json";
-      document.body.append(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-    } catch (e) { failed(e); }
-    finally { save.disabled = false; }
-  });
-  save.className = "quiet";
-  box.append(make("h2", "Back-up"), make("p", "Het bestand bevat je instellingen en de koppeling met Google, maar niet je beheerwachtwoord. Bewaar het veilig en deel het met niemand: wie het heeft, kan je camera’s bekijken."), save, note);
+  // A button that asks the server for a file and hands it to the browser.
+  const download = (title, action, name) => {
+    const btn = button(title, async () => {
+      btn.disabled = true;
+      note.classList.remove("error");
+      note.textContent = "";
+      try {
+        const link = make("a");
+        link.href = URL.createObjectURL(new Blob([JSON.stringify(await api(action), null, 2)], {type: "application/json"}));
+        link.download = "nestunifi-" + name + "-" + new Date().toISOString().slice(0, 10) + ".json";
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+      } catch (e) { failed(e); }
+      finally { btn.disabled = false; }
+    });
+    btn.className = "quiet";
+    return btn;
+  };
+  box.append(make("h2", "Back-up"), make("p", "Het bestand bevat je instellingen en de koppeling met Google, maar niet je beheerwachtwoord. Bewaar het veilig en deel het met niemand: wie het heeft, kan je camera’s bekijken."),
+    download("Back-up downloaden", "backup", "backup"),
+    make("h2", "Hulp bij een probleem"), make("p", "Het diagnosebestand bevat de versie, de toestand van elk onderdeel en de laatste logregels. Wachtwoorden, sleutels en de koppeling met Google staan er niet in; de namen en netwerkadressen van je camera’s wel. Voeg het toe als je een probleem meldt."),
+    download("Diagnose downloaden", "diagnose", "diagnose"), note);
 }
 function showSetup(note) {
   el("overview").hidden = true;

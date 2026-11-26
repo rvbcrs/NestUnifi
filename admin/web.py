@@ -19,8 +19,9 @@ MEDIA = "http://127.0.0.1:8888/"
 MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
-ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "view",
-           "setup", "client", "project", "consent", "code", "backup", "restore", "auth", "claim", "login", "logout"}
+ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest",
+           "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose",
+           "auth", "claim", "login", "logout"}
 # Everything else needs a session. A session starts when the worker accepts the admin password.
 OPEN = {"auth", "claim", "login", "logout"}
 SESSIONS = {}
@@ -32,6 +33,9 @@ for asset in (ASSETS / "assets").glob("*.svg"):
     STATIC["/assets/" + asset.name] = ("assets/" + asset.name, "image/svg+xml")
 STATIC["/assets/hls.light.min.js"] = ("assets/hls.light.min.js", "text/javascript")
 LIVE = re.compile(r"/live/(cam-[a-z0-9-]+)/([A-Za-z0-9_-]+\.(?:m3u8|ts))")
+# Every camera has a private listener inside the container, numbered 1 to 254, that gives its latest image.
+STILL = re.compile(r"/snapshot/([1-9]\d{0,2})\.jpg(?:\?\d{1,16})?")
+STILL_SOURCE = "http://127.0.0.%d/trigger/snapshot"
 direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # The media server is in this container.
 
 
@@ -46,7 +50,7 @@ class Handler(BaseHTTPRequestHandler):
             data = json.dumps(data).encode()
         self.send_response(status)
         if cookie is not None:
-            self.send_header("Set-Cookie", "nestunifi=" + cookie + "; Path=/; HttpOnly; SameSite=Strict")
+            self.send_header("Set-Cookie", self.cookie_name() + "=" + cookie + "; Path=/; HttpOnly; SameSite=Strict")
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -72,13 +76,22 @@ class Handler(BaseHTTPRequestHandler):
                 return False
         return not ipaddress.ip_address(self.client_address[0]).is_global
 
+    def cookie_name(self):
+        """A name of its own for each scheme and port. Browsers share cookies between the ports of an address, and
+        never let a page over http replace a Secure cookie. With one name, a second NestUnifi on this system or an
+        earlier visit over https would end this session, or keep it from starting."""
+        origin = urlsplit(self.headers.get("Origin") or "")
+        secure = origin.scheme == "https"
+        return "nestunifi-%s%d" % ("s" if secure else "", origin.port or (443 if secure else 80))
+
     def session(self):
         # Browsers also send the cookies of other apps on this address, whatever their port. Python's cookie
-        # parser silently drops everything after a value it cannot read, so only our own pair is looked up.
+        # parser silently drops everything after a value it cannot read, so only our own pairs are looked up.
+        # The value is the secret; any of our names may carry it.
         token = ""
         for pair in ";".join(self.headers.get_all("Cookie") or []).split(";"):
             name, _, value = pair.strip().partition("=")
-            if name == "nestunifi" and value in SESSIONS:
+            if name.startswith("nestunifi-") and value in SESSIONS:
                 token = value
                 break
         if SESSIONS.get(token, 0) > time.time():
@@ -100,6 +113,13 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.reply(502, {})
 
+    def still(self, number):
+        try:
+            with direct.open(STILL_SOURCE % number, timeout=20) as source:
+                self.reply(200, source.read(4 << 20), "image/jpeg")
+        except OSError:  # The camera has no image now, or is not running.
+            self.reply(502, {})
+
     def do_GET(self):
         if not self.local():
             return self.refuse()
@@ -108,6 +128,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self.session():
                 return self.reply(401, {})
             return self.video(match[1], match[2])
+        match = STILL.fullmatch(self.path)
+        if match and int(match[1]) <= 254:
+            if not self.session():
+                return self.reply(401, {})
+            return self.still(int(match[1]))
         path = urlsplit(self.path).path
         if path not in STATIC or (path != self.path and path != "/oauth2callback"):
             return self.reply(404, {})

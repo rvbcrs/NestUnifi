@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Aiaid/onvif-proxy/internal/soap"
 )
@@ -49,7 +50,14 @@ func TestMotionPullPoints(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go first.ServeTrigger(ctx, ln)
-	motion := func() (state struct{ Active bool; Last string }) {
+	motion := func() (state struct {
+		Active    bool
+		Last      string
+		Detected  map[string]string
+		Listeners int
+		Delivered string
+		Viewers   int
+	}) {
 		t.Helper()
 		r, err := http.Get("http://" + ln.Addr().String() + "/trigger/motion")
 		if err != nil {
@@ -61,17 +69,80 @@ func TestMotionPullPoints(t *testing.T) {
 		}
 		return state
 	}
-	if state := motion(); state.Active || state.Last != "" {
-		t.Fatal("motion reported before any trigger", state)
-	}
-	for _, state := range []string{"on", "on", "off"} {
-		r, err := http.Post("http://"+ln.Addr().String()+"/trigger/motion?state="+state, "text/plain", nil)
+	trigger := func(query string) int {
+		t.Helper()
+		r, err := http.Post("http://"+ln.Addr().String()+"/trigger/"+query, "text/plain", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		r.Body.Close()
-		if r.StatusCode != 200 {
-			t.Fatal(r.Status)
+		return r.StatusCode
+	}
+	if state := motion(); state.Active || state.Last != "" || state.Listeners != 1 || state.Delivered != "" || len(state.Detected) != 0 {
+		t.Fatal("unexpected state before any trigger", state)
+	}
+	// The admin page's test is a motion the recorder hears, but not a detection.
+	if trigger("motion?state=test") != 200 || trigger("motion?state=test") != 409 {
+		t.Fatal("test motion not started once")
+	}
+	if state := motion(); !state.Active || state.Last != "" {
+		t.Fatal("test motion counted as a detection", state)
+	}
+	if response := eventCall(first, points[0], pull); !strings.Contains(response, `Name="State" Value="true"`) {
+		t.Fatal("test motion not delivered", response)
+	}
+	if state := motion(); state.Delivered == "" {
+		t.Fatal("delivery not recorded", state)
+	}
+	first.events.mu.Lock()
+	first.events.testing = false // as a real "off" does; the test's own timer then leaves the level alone
+	first.events.set(false, time.Now())
+	first.events.mu.Unlock()
+	if response := eventCall(first, points[0], pull); !strings.Contains(response, `Name="State" Value="false"`) {
+		t.Fatal("end of test motion not delivered", response)
+	}
+	// A recorder that opens the video stream is counted until it closes it.
+	stream, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	counted := first.Watched(stream)
+	dialed, err := net.Dial("tcp4", stream.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := counted.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := motion(); state.Viewers != 1 {
+		t.Fatal("open stream not counted", state)
+	}
+	accepted.Close()
+	accepted.Close()
+	dialed.Close()
+	if state := motion(); state.Viewers != 0 {
+		t.Fatal("closed stream still counted", state)
+	}
+	first.opts.SnapshotFunc = func(context.Context, string) ([]byte, string, error) { return []byte("JPEG"), "image/jpeg", nil }
+	still, err := http.Get("http://" + ln.Addr().String() + "/trigger/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	still.Body.Close()
+	if still.StatusCode != 200 || still.Header.Get("Content-Type") != "image/jpeg" {
+		t.Fatal("no still on the private listener", still.Status)
+	}
+	if trigger("event?kind=chime") != 200 || trigger("event?kind=earthquake") != 400 {
+		t.Fatal("detection kinds not checked")
+	}
+	if state := motion(); state.Detected["chime"] == "" || len(state.Detected) != 1 {
+		t.Fatal("detection kind not recorded", state)
+	}
+	for _, state := range []string{"on", "on", "off"} {
+		if code := trigger("motion?state=" + state); code != 200 {
+			t.Fatal(code)
 		}
 	}
 	if state := motion(); state.Active || state.Last == "" {

@@ -65,6 +65,18 @@ De naam van de interface vind je met `ip -4 route show default`, achter het woor
 - **Back-up en verhuizen.** Onder het tandwiel op de beheerpagina download je een back-up van je instellingen en
   de koppeling met Google. Op een nieuw systeem zet je die daar terug, voordat je camera's toevoegt. Zet
   NestUnifi op het oude systeem eerst uit: beide zouden dezelfde netwerkadressen gebruiken.
+- **Meldingen.** Protect kent van deze camera's alleen beweging. Vul onder het tandwiel het adres van een eigen
+  webhook in, bijvoorbeeld van een automatisering in Home Assistant, en NestUnifi stuurt daar een JSON-bericht
+  naartoe wanneer er wordt aangebeld, wanneer een persoon is gezien of wanneer er iets hapert: de koppeling met
+  Google, het meldingskanaal of een camera die vijf minuten geen beeld geeft. Het bericht heeft de velden `title`,
+  `message`, `event`, `camera` en `time`.
+- **Komt beweging niet aan in Protect?** Kies bij de camera voor Testbeweging sturen. Staat die wel in de tijdlijn
+  van Protect, dan ligt het aan het meldingskanaal van Google en wijst de beheerpagina de stap aan die het herstelt.
+- **Pauzeren.** Een gepauzeerde camera vraagt geen beeld meer op bij Google en verdwijnt uit je netwerk, tot je
+  haar hervat. Naam, adres en wachtwoord blijven bewaard.
+- **Een probleem melden.** Onder het tandwiel download je een diagnosebestand met de versie, de toestand van elk
+  onderdeel en de laatste logregels. Wachtwoorden en sleutels staan er niet in; namen en netwerkadressen van je
+  camera's wel.
 - **Bijwerken:** draai `sh install.sh` opnieuw. Het haalt de nieuwste versie op; je instellingen blijven staan.
   De beheerpagina meldt wanneer er een nieuwe versie is. Daarvoor vraagt NestUnifi eens per dag de lijst met
   versies op bij `ghcr.io`.

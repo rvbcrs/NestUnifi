@@ -106,6 +106,15 @@
  
  		for _, b := range dev.ProxyBindings() {
  			b := b
+@@ -249,7 +264,7 @@
+ 				state: state,
+ 				ln:    rtspLn,
+ 				run: func(ctx context.Context) error {
+-					return rtspproxy.Serve(ctx, rtspLn, b.Target)
++					return rtspproxy.Serve(ctx, srv.Watched(rtspLn), b.Target)
+ 				},
+ 			})
+ 		}
 --- a/internal/discovery/messages.go
 +++ b/internal/discovery/messages.go
 @@ -106,7 +106,7 @@
