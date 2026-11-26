@@ -109,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
             with direct.open(request, timeout=20) as source:
                 self.reply(200, source.read(), source.headers.get_content_type())
         except urllib.error.HTTPError as exc:
+            exc.close()
             self.reply(exc.code, {})
         except OSError:
             self.reply(502, {})
@@ -117,7 +118,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with direct.open(STILL_SOURCE % number, timeout=20) as source:
                 self.reply(200, source.read(4 << 20), "image/jpeg")
-        except OSError:  # The camera has no image now, or is not running.
+        except urllib.error.HTTPError as exc:  # The camera has no image now.
+            exc.close()
+            self.reply(502, {})
+        except OSError:  # The camera is not running.
             self.reply(502, {})
 
     def do_GET(self):

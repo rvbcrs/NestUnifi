@@ -78,8 +78,9 @@ class CameraChanges(unittest.TestCase):
     def test_service_output_is_passed_on_and_kept(self):
         with patch.object(runtime, "LOG", Path("log.txt")), patch.object(runtime.sys, "stdout", io.StringIO()) as shown:
             runtime.spawn(["sh", "-c", "echo started; echo failed >&2"]).wait()
-            for _ in range(50):
-                if shown.getvalue().count("\n") == 2:
+            # A thread passes each line on, to the container log first and then to the file.
+            for _ in range(100):
+                if runtime.LOG.exists() and runtime.LOG.read_text().count("\n") == 2:
                     break
                 time.sleep(0.02)
             self.assertEqual(sorted(shown.getvalue().split()), ["failed", "started"])
