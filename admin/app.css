@@ -271,6 +271,15 @@ h2 {
   height: 100%;
   object-fit: cover;
 }
+.device .still.tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-content: center;
+}
+.device .still.tiles img {
+  height: auto;
+  aspect-ratio: 16/9;
+}
 .device:hover,
 .device:focus-within {
   border-color: #aa8ac5;

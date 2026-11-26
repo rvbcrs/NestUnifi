@@ -193,7 +193,9 @@ class Endpoint:
         if self.dhcp is None or self.dhcp.poll() is not None:
             known = remembered().get(mac)
             request = ["-r", known] if isinstance(known, str) and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", known) else []
-            self.dhcp = subprocess.Popen(["udhcpc", "-f", "-i", self.dev, "-p", "/run/"+self.dev+".pid",
+            # -a: ask the network whether the offered address is taken. A router can hand out the address of a
+            # device that set its own, and then a recorder reaches now this camera and now that device.
+            self.dhcp = subprocess.Popen(["udhcpc", "-f", "-a", "-i", self.dev, "-p", "/run/"+self.dev+".pid",
                                           "-s", "/app/lease.py", "-x", "hostname:"+self.hostname, *request],
                                          stdout=subprocess.DEVNULL)
         address = self.lease.read_text() if self.lease.exists() else ""

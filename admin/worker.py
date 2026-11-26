@@ -119,7 +119,7 @@ def name_input(value):
     value = value.strip()
     if not 1 <= len(value) <= MAX_NAME or not any(c.isalnum() for c in value) or any(
             not c.isalnum() and c not in " -'()._" for c in value):
-        raise Problem("Gebruik maximaal 48 letters, cijfers, spaties of de tekens - ' ( ) . _")
+        raise Problem("Gebruik voor de naam maximaal 48 letters, cijfers, spaties of de tekens - ' ( ) . _")
     return value
 
 

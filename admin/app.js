@@ -77,13 +77,18 @@ function renderDevices() {
     row.append(open, head, footer);
     if (withStills) {
       // The camera's latest image. A camera without one gets the empty frame, so every card is as tall.
-      const frame = make("div", undefined, "still");
-      if (cam.still && cam.live) {
+      // A mix shows the images of its cameras, in the places they have in its picture.
+      const frame = make("div", undefined, "still"), parts = cam.parts ? cam.parts.map(name => devices.find(c => c.name === name)) : [cam];
+      if (cam.parts) frame.classList.add("tiles");
+      for (const part of cam.live ? parts : []) {
         const still = make("img");
         still.alt = "";
         still.loading = "lazy";
-        still.onerror = () => still.remove();
-        still.src = cam.still + "?" + stills;
+        still.onerror = () => { still.style.visibility = "hidden"; };
+        if (part && part.still && part.live) {
+          still.dataset.source = part.still;
+          still.src = part.still + "?" + stills;
+        }
         frame.append(still);
       }
       row.prepend(frame);
@@ -141,6 +146,16 @@ function render(state) {
   el("bridge").classList.toggle("active", bridge);
   el("overviewStatus").hidden = el("bridge").hidden = false;
 }
+// The stills follow the cameras while the overview is in sight. A camera makes a new one at most every ten seconds.
+setInterval(() => {
+  if (document.hidden || el("overview").hidden || el("modal").open) return;
+  const moment = Date.now();  // One for all, so a camera that is also in a mix is fetched once.
+  for (const still of document.querySelectorAll(".still img[data-source]")) {
+    const next = new Image();
+    next.onload = () => { still.src = next.src; still.style.visibility = ""; };
+    next.src = still.dataset.source + "?" + moment;
+  }
+}, 15000);
 async function refresh() {
   el("refresh").disabled = true;
   try { render(await api("list")); } finally { el("refresh").disabled = false; }
@@ -179,6 +194,8 @@ function inputName(value) {
   input.maxLength = 48;
   input.required = true;
   input.value = value;
+  // The same rule as the server's, told at the field itself.
+  input.oninput = () => input.setCustomValidity(/^(?=.*[\p{L}\p{N}])[\p{L}\p{N} '()._-]+$/u.test(input.value.trim()) ? "" : "Gebruik letters, cijfers, spaties of de tekens - ' ( ) . _");
   el("fields").append(label, input);
   return input;
 }
