@@ -72,6 +72,11 @@ De naam van de interface vind je met `ip -4 route show default`, achter het woor
   `message`, `event`, `camera` en `time`.
 - **Komt beweging niet aan in Protect?** Kies bij de camera voor Testbeweging sturen. Staat die wel in de tijdlijn
   van Protect, dan ligt het aan het meldingskanaal van Google en wijst de beheerpagina de stap aan die het herstelt.
+- **Camera's samenvoegen.** Met Samenvoegen op de beheerpagina zet je twee tot vier camera's naast elkaar in één
+  beeld, met hun geluid in één spoor. Bekijk het eerst, of voeg het toe als camera: het krijgt een eigen adres in
+  je netwerk en je adopteert het in Protect zoals elke andere camera. Het samenvoegen kost rekenkracht zolang
+  iemand kijkt of Protect opneemt; op een Raspberry Pi is dat merkbaar. Valt een camera weg, dan blijft haar vak
+  zwart tot ze terug is.
 - **Pauzeren.** Een gepauzeerde camera vraagt geen beeld meer op bij Google en verdwijnt uit je netwerk, tot je
   haar hervat. Naam, adres en wachtwoord blijven bewaard.
 - **Een probleem melden.** Onder het tandwiel download je een diagnosebestand met de versie, de toestand van elk

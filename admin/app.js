@@ -26,7 +26,8 @@ function button(title, fn) {
 const kinds = {
   CAMERA: ["Camera", "Camera’s", "video-camera"],
   DOORBELL: ["Deurbel", "Deurbellen", "bell"],
-  DISPLAY: ["Nest Hub", "Nest Hubs", "monitor"]
+  DISPLAY: ["Nest Hub", "Nest Hubs", "monitor"],
+  MIX: ["Samengesteld beeld", "Samengesteld", "squares-four"]
 };
 function icon(name) {
   const img = make("img");
@@ -56,7 +57,7 @@ function renderDevices() {
     const badge = make("span", undefined, "kind-icon");
     badge.append(icon(symbol));
     const title = make("div");
-    title.append(make("h3", cam.name), make("p", [cam.model || type, cam.ip, motionText(cam.motion)].filter(Boolean).join(" · ")));
+    title.append(make("h3", cam.name), make("p", [cam.parts ? cam.parts.join(" + ") : cam.model || type, cam.ip, motionText(cam.motion)].filter(Boolean).join(" · ")));
     head.append(badge, title);
     const open = button("", () => watch(cam));
     open.className = "stream-link";
@@ -193,7 +194,8 @@ async function watch(cam, reconnect = true) {
   const media = make("video");
   video = media;
   media.controls = media.autoplay = media.playsInline = true;
-  media.muted = !cam.mix;
+  const sound = cam.trial || cam.parts;  // A mix carries the sound of its cameras.
+  media.muted = !sound;
   media.setAttribute("aria-label", "Livebeeld van " + cam.name);
   const retry = button("Opnieuw proberen", () => watch(cam));
   retry.className = "quiet retry";
@@ -204,7 +206,7 @@ async function watch(cam, reconnect = true) {
     stopPlayback();
     media.hidden = true;
     retry.hidden = false;
-    message("modalMessage", text || (cam.mix ? "Het samengevoegde beeld is gestopt." : "De bridge ontvangt geen video van " + cam.name + ". Controleer het livebeeld van dit apparaat in Google Home."), true);
+    message("modalMessage", text || (sound ? "Het samengestelde beeld is gestopt." : "De bridge ontvangt geen video van " + cam.name + ". Controleer het livebeeld van dit apparaat in Google Home."), true);
   }
   function interrupted() {
     if (epoch !== modalEpoch || video !== media) return;
@@ -228,10 +230,10 @@ async function watch(cam, reconnect = true) {
     startupTimer = setTimeout(interrupted, 45000);
   };
   media.onerror = interrupted;
-  message("modalMessage", cam.mix ? "Camera’s samenvoegen. Dit duurt enkele seconden…" : "Verbinding maken met " + cam.name + "…");
+  message("modalMessage", sound ? "Camera’s samenvoegen. Dit duurt enkele seconden…" : "Verbinding maken met " + cam.name + "…");
   startupTimer = setTimeout(interrupted, 60000);
   try {
-    const {url, silent = []} = await (cam.mix ? api("mix", {ids: cam.mix}) : api("view", {id: cam.id}));
+    const {url, silent = []} = await (cam.trial ? api("mix", {ids: cam.trial}) : api("view", {id: cam.id}));
     if (epoch !== modalEpoch || video !== media) return;
     clearTimeout(startupTimer);
     startupTimer = setTimeout(interrupted, 45000);
@@ -245,7 +247,7 @@ async function watch(cam, reconnect = true) {
       player.loadSource(url);
       player.attachMedia(media);
       // A browser may refuse to start a video with sound on its own. Then it starts silent, with the sound one click away.
-      if (cam.mix) media.play().catch(() => { media.muted = true; media.play().catch(() => {}); });
+      if (sound) media.play().catch(() => { media.muted = true; media.play().catch(() => {}); });
     } else if (media.canPlayType("application/vnd.apple.mpegurl")) {
       media.src = url;
     } else {
@@ -255,7 +257,8 @@ async function watch(cam, reconnect = true) {
 }
 function settings(cam) {
   modal(cam.name);
-  if (cam.paused) el("fields").append(make("p", "Deze camera is gepauzeerd. NestUnifi vraagt Google geen beeld van haar en ze is niet zichtbaar in je netwerk."));
+  if (cam.parts) el("fields").append(make("p", "Samengesteld uit " + cam.parts.join(", ") + ". NestUnifi voegt de beelden samen zolang iemand kijkt of een recorder opneemt. Dit beeld meldt zelf geen beweging."));
+  if (cam.paused) el("fields").append(make("p", cam.parts ? "Dit samengestelde beeld is gepauzeerd en niet zichtbaar in je netwerk." : "Deze camera is gepauzeerd. NestUnifi vraagt Google geen beeld van haar en ze is niet zichtbaar in je netwerk."));
   if (cam.since) el("fields").append(make("p", "Beeld sinds " + when(cam.since * 1000) + (cam.drops ? " · " + cam.drops + (cam.drops === 1 ? " onderbreking" : " onderbrekingen") + " sinds NestUnifi startte." : " zonder onderbreking.")));
   if (cam.motion) el("fields").append(make("p", cam.motion.viewers && cam.motion.listeners ? "Een recorder haalt het beeld op en luistert naar bewegingsmeldingen."
     : cam.motion.viewers ? "Een recorder haalt het beeld op, maar luistert niet naar bewegingsmeldingen."
@@ -314,7 +317,11 @@ function rename(cam) {
 }
 function pause(cam) {
   modal(cam.paused ? "Camera hervatten" : "Camera pauzeren");
-  el("fields").append(make("strong", cam.name), make("p", cam.paused
+  el("fields").append(make("strong", cam.name));
+  if (cam.parts) el("fields").append(make("p", cam.paused
+    ? "NestUnifi zet dit samengestelde beeld terug in je netwerk, met hetzelfde adres en wachtwoord. Protect vindt het vanzelf terug."
+    : "NestUnifi haalt dit samengestelde beeld uit je netwerk. In Protect staat het als offline tot je het hervat. De camera’s zelf blijven werken."));
+  else el("fields").append(make("p", cam.paused
     ? "NestUnifi vraagt Google weer om het beeld van deze camera en zet haar terug in je netwerk, met hetzelfde adres en wachtwoord. Protect vindt haar vanzelf terug."
     : "NestUnifi vraagt Google dan geen beeld meer van deze camera en haalt haar uit je netwerk. In Protect staat ze als offline tot je haar hervat. Naam, adres en wachtwoord blijven bewaard."),
     make("p", "De gedeelde videobridge herstart kort, dus de andere camera’s haperen even."));
@@ -322,7 +329,9 @@ function pause(cam) {
 }
 function removeCamera(cam) {
   modal("Apparaat verwijderen");
-  el("fields").append(make("strong", cam.name),
+  el("fields").append(make("strong", cam.name));
+  if (cam.parts) el("fields").append(make("p", "NestUnifi stopt dit samengestelde beeld en geeft zijn netwerkadres vrij. Verwijder het ook in UniFi Protect. De camera’s zelf blijven werken."));
+  else el("fields").append(
     make("p", "NestUnifi stopt deze virtuele camera en geeft haar netwerkadres vrij. Verwijder het apparaat ook in UniFi Protect. De gedeelde videobridge herstart kort, dus de andere camera’s haperen even."),
     make("p", "Later opnieuw toevoegen kan via Apparaat toevoegen; het apparaat krijgt dan dezelfde netwerkidentiteit. Wil je het niet meer met NestUnifi delen, zet het dan uit bij de Google-koppeling in stap 4."));
   el("submit").classList.add("danger");
@@ -712,11 +721,12 @@ function renderBackup(s) {
     make("h2", "Hulp bij een probleem"), make("p", "Het diagnosebestand bevat de versie, de toestand van elk onderdeel en de laatste logregels. Wachtwoorden, sleutels en de koppeling met Google staan er niet in; de namen en netwerkadressen van je camera’s wel. Voeg het toe als je een probleem meldt."),
     download("Diagnose downloaden", "diagnose", "diagnose"), note);
 }
-// A trial: several cameras side by side in one picture, with the sound of all of them in one track.
+// Several cameras side by side in one picture, with the sound of all of them in one track: first to look at, then
+// as a camera of its own that a recorder can adopt.
 function showMix() {
-  const form = el("mixForm"), note = make("p", undefined, "message"), row = submit("Samenvoegen");
+  const form = el("mixForm"), note = make("p", undefined, "message"), row = submit("Als camera toevoegen");
   note.setAttribute("role", "status");
-  const checks = devices.filter(cam => !cam.paused).map(cam => {
+  const checks = devices.filter(cam => !cam.paused && !cam.parts).map(cam => {
     const label = make("label", undefined, "pick"), check = make("input");
     check.type = "checkbox";
     check.value = cam.id;
@@ -724,14 +734,37 @@ function showMix() {
     label.append(check, cam.name + (cam.live ? "" : " · geen beeld"));
     return label;
   });
-  form.replaceChildren(make("p", "Kies twee tot vier camera’s. NestUnifi zet ze naast elkaar in één beeld en mengt hun geluid. Het samenvoegen kost rekenkracht zolang je kijkt en stopt een minuut nadat je het beeld sluit. Je camera’s in UniFi Protect merken er niets van."), ...checks, row, note);
-  form.onsubmit = e => {
-    e.preventDefault();
-    const ids = checks.map(label => label.firstChild).filter(check => check.checked).map(check => check.value);
-    const fits = ids.length >= 2 && ids.length <= 4;
+  // The chosen cameras, in the order of the list. Gives nothing and says why when the number does not fit.
+  const chosen = () => {
+    const picked = checks.map(label => label.firstChild).filter(check => check.checked);
+    const fits = picked.length >= 2 && picked.length <= 4;
     note.textContent = fits ? "" : "Kies twee tot vier camera’s.";
     note.classList.toggle("error", !fits);
-    if (fits) watch({name: "Samengevoegd beeld", mix: ids});
+    return fits ? picked : null;
+  };
+  const look = button("Eerst bekijken", () => {
+    const picked = chosen();
+    if (picked) watch({name: "Samengesteld beeld", trial: picked.map(check => check.value)});
+  });
+  look.className = "quiet";
+  row.prepend(look);
+  form.replaceChildren(make("p", "Kies twee tot vier camera’s. NestUnifi zet ze naast elkaar in één beeld en mengt hun geluid. Bekijk het resultaat eerst, of voeg het toe als camera: het krijgt dan een eigen adres in je netwerk en je adopteert het in UniFi Protect zoals elke andere camera."),
+    make("p", "Het samenvoegen kost rekenkracht zolang iemand kijkt. Neemt Protect het beeld doorlopend op, dan is dat de hele dag."), ...checks, row, note);
+  form.onsubmit = e => {
+    e.preventDefault();
+    const picked = chosen();
+    if (!picked) return;
+    modal("Samengesteld beeld toevoegen");
+    el("fields").append(make("p", picked.map(check => check.parentNode.textContent).join(" + ")));
+    const field = inputName("Samengesteld beeld"), password = passwordFields();
+    field.select();
+    el("fields").append(make("p", "Adopteer het beeld in UniFi Protect met gebruikersnaam " + devices.find(cam => cam.id === picked[0].value).username + " en dit wachtwoord."));
+    onSubmit("Toevoegen", async () => {
+      const result = await api("mixadd", {ids: picked.map(check => check.value), name: field.value, password: password.value});
+      el("mix").hidden = true;
+      el("overview").hidden = false;
+      return result;
+    });
   };
   el("overview").hidden = true;
   el("mix").hidden = false;

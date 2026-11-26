@@ -17,7 +17,7 @@ MEDIA = "http://127.0.0.1:8888/"
 MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
-ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest", "mix",
+ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest", "mix", "mixadd",
            "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose"}
 # Google returns the browser to /oauth2callback with the code in the query. The page itself hands it in.
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/oauth2callback": ("index.html", "text/html; charset=utf-8"),

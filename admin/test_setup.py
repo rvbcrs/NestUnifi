@@ -199,6 +199,31 @@ class Wizard(unittest.TestCase):
         with self.assertRaisesRegex(worker.Problem, "zonder camera"):
             self.ask("restore", backup=saved)
 
+    def test_backup_brings_a_mix_back_with_a_command_of_nestunifi_itself(self):
+        self.devices.append({"device_id": "enterprises/p/devices/b", "type": "CAMERA", "name": "Oprit", "protocols": ["WEB_RTC"]})
+        self.linked_with_camera()
+        self.ask("add", id=self.ask("discover")["available"][0]["id"], name="Oprit", password="oprit-camera-1")
+        parts = [c["uuid"] for c in worker.read(worker.ONVIF)["devices"]]
+        self.ask("mixadd", ids=parts, name="Buiten", password="mix-camera-1")
+        # Connecting Google Cloud again gives every camera its motion address. A mix has none and is left alone.
+        self.ask("code", code="4/qrstuvwx", state=self.consent("cloud")[1])
+        saved = json.loads(json.dumps(self.ask("backup")))
+        old = worker.read(worker.MEDIA)
+        mix = worker.read(worker.ONVIF)["devices"][-1]
+        path = worker.stream_path(mix)
+        self.assertTrue(old["paths"][path]["runOnDemand"].startswith("python3 -IB /app/mixer.py " + path + " cam-device-"))
+        self.fresh_installation()
+        for broken in ({"mix": parts[:1]}, {"mix": parts + ["unknown"]}, {"mix": [parts[0], mix["uuid"]]}, {"mix": "x"},
+                       {"streams": [dict(mix["streams"][0], rtsp="rtsp://mediamtx:8554/cam-other")]}):
+            devices = saved["files"]["onvif/config.yaml"]["devices"]
+            wrong = dict(saved["files"], **{"onvif/config.yaml": {"devices": devices[:-1] + [dict(devices[-1], **broken)]}})
+            with self.assertRaisesRegex(worker.Problem, "onvolledig"):
+                self.ask("restore", backup={"nestunifi": 1, "files": wrong})
+        saved["files"]["media/mediamtx.yml"]["paths"][path] = {"runOnDemand": "touch /tmp/owned"}
+        self.assertEqual(self.ask("restore", backup=saved)["cameras"], 2)
+        self.assertEqual(worker.read(worker.MEDIA)["paths"], old["paths"])
+        self.assertEqual(worker.read(worker.ONVIF)["devices"][-1], mix)
+
     def test_failed_restore_leaves_the_new_installation_as_it_was(self):
         self.linked_with_camera()
         saved = self.ask("backup")

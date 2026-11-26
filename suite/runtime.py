@@ -155,6 +155,7 @@ def device_config(cam):
     device = cam.copy()
     device.pop("kind", None)
     device.pop("paused", None)
+    device.pop("mix", None)
     name = device.pop("display_name", cam["name"])
     device.update(name=name, ports={"soap": 80, "rtsp": 554})
     return {"server": {"discovery": True}, "web": {"enabled": False}, "devices": [device]}

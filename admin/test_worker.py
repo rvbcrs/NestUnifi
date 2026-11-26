@@ -2,12 +2,14 @@
 import io
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import mixer
 import worker
 from suite import runtime
 from suite.runtime import device_config, lan_interface
@@ -56,14 +58,20 @@ class CameraChanges(unittest.TestCase):
         self.assertEqual(set(media["paths"]), {"cam-keuken-camera", worker.SOUND})
         self.assertFalse(worker.prepare(media, self.bridge))
 
-    def test_mix_shows_the_cameras_side_by_side_with_the_sound_of_those_that_have_it(self):
-        garden = dict(self.onvif["devices"][0], name="Tuin", uuid="garden-id", streams=[
+    def two_cameras(self):
+        garden = dict(self.onvif["devices"][0], name="Tuin", uuid="garden-id", mac="02:ab:cd:ef:00:02",
+                      ports={"soap": 18082, "rtsp": 18555}, streams=[
             dict(self.onvif["devices"][0]["streams"][0], rtsp="rtsp://test:fixture@mediamtx:8554/cam-tuin")])
         self.onvif["devices"].append(garden)
+        self.bridge["cameras"].append({"device_id": "enterprises/test/devices/garden", "name": "Tuin", "onvif": {"ip": "127.0.0.2"}})
         worker.prepare(self.media, self.bridge)
         self.media["paths"]["cam-tuin"] = {}
-        worker.ONVIF.write_text(json.dumps(self.onvif))
-        worker.MEDIA.write_text(json.dumps(self.media))
+        self.media["authInternalUsers"][0]["permissions"].append({"action": "read", "path": "cam-tuin"})
+        for path, data in [(worker.ONVIF, self.onvif), (worker.BRIDGE, self.bridge), (worker.MEDIA, self.media)]:
+            path.write_text(json.dumps(data))
+
+    def test_mix_is_tried_out_with_the_sound_of_the_cameras_that_have_it(self):
+        self.two_cameras()
         publishing = {"cam-keuken-camera", "cam-keuken-camera-audio", "cam-tuin", "mix"}
         asked = []
         def describe(path, username, password, timeout=6):
@@ -75,16 +83,9 @@ class CameraChanges(unittest.TestCase):
                     worker.mix({"ids": wrong})
             self.assertEqual(worker.mix({"ids": ["fixed-id", "garden-id"]}),
                              {"url": "/live/mix/index.m3u8", "silent": ["Tuin"]})
-            route = worker.read(worker.MEDIA)["paths"]["mix"]
-            command = route["runOnDemand"].split(" ")
-            secret = self.media["authInternalUsers"][-1]["pass"]
-            source = "rtsp://%s:%s@127.0.0.1:8554/" % (worker.MIXER, secret)
-            self.assertEqual([command[i + 1] for i, arg in enumerate(command) if arg == "-i"],
-                             [source + path for path in ("cam-keuken-camera", "cam-tuin", "cam-keuken-camera-audio")])
-            graph = command[command.index("-filter_complex") + 1]
-            self.assertIn("[v0][v1]xstack=inputs=2:layout=0_0|640_0:fill=black:shortest=1[v]", graph)
-            self.assertIn("[2:a]amix=inputs=1:duration=shortest:normalize=0[a]", graph)
-            self.assertEqual(command[-1], source + "mix")
+            # The media server runs the mixer while someone watches. No password is on that line.
+            self.assertEqual(worker.read(worker.MEDIA)["paths"]["mix"]["runOnDemand"],
+                             "python3 -IB /app/mixer.py mix cam-keuken-camera cam-tuin")
             self.assertEqual(asked[-1], ("mix", worker.MIXER))
             # The same choice again leaves the file alone, so a running mix goes on.
             written = worker.MEDIA.stat().st_mtime_ns
@@ -96,14 +97,108 @@ class CameraChanges(unittest.TestCase):
             publishing.remove("cam-tuin")
             with self.assertRaisesRegex(worker.Problem, "geen video van Tuin"):
                 worker.mix({"ids": ["fixed-id", "garden-id"]})
-        four = worker.mix_command(["a", "b", "c", "d"], [], "rtsp://x/")
-        self.assertIn("layout=0_0|640_0|0_360|640_360", four[four.index("-filter_complex") + 1])
-        self.assertNotIn("-c:a", four)
-        self.assertFalse(any(" " in arg for arg in four))
-        # A password with a space would add arguments of its own to the command.
-        for unsafe in ("x -f null", "x'y", 'x"y', "x\\y", "x\ty"):
-            with self.assertRaisesRegex(worker.Problem, "beschadigd"):
-                worker.mix_command(["a", "b"], [], "rtsp://mixer:%s@127.0.0.1:8554/" % unsafe)
+
+    def test_mixer_gives_every_camera_a_tile_and_leaves_a_missing_one_black(self):
+        source = "rtsp://u:p@127.0.0.1:8554/"
+        command = mixer.command("out", ["a", None, "c"], ["a-audio", "c-audio"], source)
+        self.assertEqual([command[i + 1] for i, arg in enumerate(command) if arg == "-i"],
+                         [source + path for path in ("a", "c", "a-audio", "c-audio")])
+        graph = command[command.index("-filter_complex") + 1].split(";")
+        self.assertTrue(graph[0].startswith("[0:v]fps=15,scale=640:360:") and graph[0].endswith("[v0]"))
+        self.assertEqual(graph[1], "color=black:size=640x360:rate=15[v1]")
+        self.assertTrue(graph[2].startswith("[1:v]") and graph[2].endswith("[v2]"))
+        self.assertEqual(graph[3:], ["[v0][v1][v2]xstack=inputs=3:layout=0_0|640_0|0_360:fill=black:shortest=1[v]",
+                                     "[2:a][3:a]amix=inputs=2:duration=shortest:normalize=0[a]"])
+        self.assertEqual(command[-1], source + "out")
+        self.assertNotIn("-c:a", mixer.command("out", ["a", "b"], [], source))
+        self.assertEqual((mixer.size(2), mixer.size(3), mixer.size(4)), ((1280, 360), (1280, 720), (1280, 720)))
+
+    def test_mixer_starts_with_what_there_is_and_starts_over_when_a_camera_is_back(self):
+        class Mix:
+            def __init__(self, command):
+                started.append(command)
+                self.waits, self.ended = 0, False
+            def wait(self, timeout):
+                self.waits += 1
+                if not self.ended:
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                return 0
+            def terminate(self):
+                self.ended = True
+        started, publishing = [], {"a", "a-audio"}
+        def describe(path, username, password, timeout=6):
+            if started and started[-1] and path == "b":
+                publishing.add("b")  # The second camera comes back while the mix runs.
+            return 200 if path in publishing else 404
+        config = Path("mediamtx.yml")
+        config.write_text(json.dumps({"authInternalUsers": [{"user": mixer.USER, "pass": "s3cret"}]}))
+        with patch.multiple(mixer, MEDIA=str(config), describe=describe), patch.object(mixer.signal, "signal"), \
+                patch.object(mixer.subprocess, "Popen", Mix):
+            self.assertEqual(mixer.main("out", ["a", "b"]), 0)
+            self.assertEqual(len(started), 1)
+            inputs = [started[0][i + 1] for i, arg in enumerate(started[0]) if arg == "-i"]
+            self.assertEqual(inputs, ["rtsp://%s:s3cret@127.0.0.1:8554/%s" % (mixer.USER, path) for path in ("a", "a-audio")])
+            self.assertIn("color=black", started[0][started[0].index("-filter_complex") + 1])
+            # Without a single picture there is nothing to mix.
+            publishing.clear()
+            started.clear()
+            self.assertEqual(mixer.main("out", ["x", "y"]), 1)
+            self.assertEqual(started, [])
+
+    def test_mix_becomes_a_camera_of_its_own_without_touching_the_bridge(self):
+        self.two_cameras()
+        bridge_written = worker.BRIDGE.stat().st_mtime_ns
+        made = worker.dispatch({"action": "mixadd", "ids": ["fixed-id", "garden-id"], "name": "Voor en achter", "password": "mix-camera-1"})
+        self.assertEqual(made, {"name": "Voor en achter"})
+        cam = worker.read(worker.ONVIF)["devices"][-1]
+        path = "cam-" + cam["name"]
+        self.assertRegex(path, "^" + worker.MIXES[2:])
+        self.assertEqual((cam["kind"], cam["mix"], cam["ports"]), ("MIX", ["fixed-id", "garden-id"], {"soap": 18083, "rtsp": 18556}))
+        self.assertEqual(cam["streams"][0], {"name": "main", "rtsp": "rtsp://test:mix-camera-1@mediamtx:8554/" + path,
+                                             "width": 1280, "height": 360, "framerate": 15, "bitrate": 1500})
+        self.assertNotIn("mix", device_config(cam)["devices"][0])
+        media = worker.read(worker.MEDIA)
+        self.assertEqual(media["paths"][path]["runOnDemand"], "python3 -IB /app/mixer.py %s cam-keuken-camera cam-tuin" % path)
+        self.assertIn({"user": "test", "pass": "mix-camera-1", "permissions": [{"action": "read", "path": path}]}, media["authInternalUsers"])
+        # A new bridge file would restart every camera. A mix is nothing to the bridge.
+        self.assertEqual(worker.BRIDGE.stat().st_mtime_ns, bridge_written)
+        publishing = {"cam-keuken-camera"}
+        asked = []
+        def describe(asked_path, username, password, timeout=6):
+            asked.append(asked_path)
+            return 200 if asked_path in publishing else 404
+        state = {"media": True, "bridge": True, "cameras": {}, "streams": {}}
+        with patch.object(worker, "describe", describe), patch.multiple(worker, read=lambda p: state if p == worker.STATE else json.loads(p.read_text()),
+                google_link=lambda: "ok", newer_version=lambda: None, link_expiry=lambda: None):
+            shown = {c["name"]: c for c in worker.status()["cameras"]}
+            # The overview does not ask for the mix itself: that would start it. It follows its cameras.
+            self.assertNotIn(path, asked)
+            self.assertEqual((shown["Voor en achter"]["live"], shown["Voor en achter"]["parts"], shown["Voor en achter"]["kind"]),
+                             (True, ["Keuken camera", "Tuin"], "MIX"))
+            self.assertIsNone(shown["Tuin"]["parts"])
+            with self.assertRaisesRegex(worker.Problem, "niet gestart"):
+                worker.dispatch({"action": "view", "id": cam["uuid"]})
+            publishing.add(path)
+            self.assertEqual(worker.dispatch({"action": "view", "id": cam["uuid"]}), {"url": "/live/" + path + "/index.m3u8"})
+        for refused, wrong in (("deel van een ander", ["fixed-id", cam["uuid"]]), ("twee tot vier", ["fixed-id"])):
+            with self.assertRaisesRegex(worker.Problem, refused):
+                worker.dispatch({"action": "mixadd", "ids": wrong, "name": "Nog een", "password": "mix-camera-2"})
+        with self.assertRaisesRegex(worker.Problem, "al een camera met deze naam"):
+            worker.dispatch({"action": "mixadd", "ids": ["fixed-id", "garden-id"], "name": "voor en achter", "password": "mix-camera-2"})
+        with self.assertRaisesRegex(worker.Problem, "deel van het samengestelde beeld Voor en achter"):
+            worker.dispatch({"action": "remove", "id": "garden-id"})
+        self.assertEqual(worker.dispatch({"action": "pause", "id": cam["uuid"], "paused": True}), {"name": "Voor en achter", "paused": True})
+        self.assertIs(worker.read(worker.ONVIF)["devices"][-1]["paused"], True)
+        # The next camera takes its settings from a camera, not from the mix, and gets a number of its own.
+        worker.change("add", self.req)
+        added = worker.read(worker.ONVIF)["devices"][-1]
+        self.assertEqual((worker.read(worker.MEDIA)["paths"]["cam-" + added["name"]], added["ports"]["soap"]), ({}, 18084))
+        worker.change("remove", {"id": added["uuid"]})
+        bridge_written = worker.BRIDGE.stat().st_mtime_ns
+        self.assertEqual(worker.dispatch({"action": "remove", "id": cam["uuid"]}), {"name": "Voor en achter", "removed": True})
+        self.assertEqual((worker.read(worker.ONVIF), worker.read(worker.MEDIA)), (self.onvif, self.media))
+        self.assertEqual(worker.BRIDGE.stat().st_mtime_ns, bridge_written)
+        self.assertFalse(worker.PENDING.exists())
 
     def test_camera_server_config_uses_onvif_fields(self):
         cam = dict(self.onvif["devices"][0], kind="DISPLAY", display_name="Woonkamer",

@@ -15,7 +15,7 @@ USER root
 RUN apk add --no-cache python3 iproute2 ca-certificates && mkdir -p /state/private && chmod 0700 /state/private && ln -s /config /state/private/bridge && ln -s /media-config /state/private/media
 COPY --from=build /out/nest-bridge /out/nest-camera /usr/local/bin/
 COPY --from=media /mediamtx /usr/local/bin/mediamtx
-COPY admin/web.py admin/worker.py admin/google_api.py admin/index.html admin/app.css admin/app.js suite/runtime.py suite/lease.py /app/
+COPY admin/web.py admin/worker.py admin/mixer.py admin/google_api.py admin/index.html admin/app.css admin/app.js suite/runtime.py suite/lease.py /app/
 COPY admin/assets /app/assets
 COPY UPSTREAM-LICENSE /usr/share/licenses/nest-bridge/LICENSE
 COPY suite/upstream/LICENSE /usr/share/licenses/onvif-proxy/LICENSE
