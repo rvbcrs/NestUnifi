@@ -1,7 +1,16 @@
 diff --git a/internal/cli/serve.go b/internal/cli/serve.go
-index ef3d0a4..d2972fa 100644
+index ef3d0a4..db12103 100644
 --- a/internal/cli/serve.go
 +++ b/internal/cli/serve.go
+@@ -58,7 +58,7 @@ func RunServe(ctx context.Context, cfgPath, tokenPath string) error {
+ 	sup := supervisor.New(cfg.Cameras, func(cam config.Camera) (supervisor.Runner, error) {
+ 		manager := session.NewManager(cam, client.StreamAPIFor(), sched, clock)
+ 		manager.SetSinkFactory(func(c config.Camera) (session.TrackSink, error) {
+-			return media.NewPublisher(c, cfg.Media.RTSPBaseURL)
++			return media.WithSound(c, cfg.Media.RTSPBaseURL)
+ 		})
+ 		return manager, nil
+ 	})
 @@ -133,8 +133,11 @@ func startEvents(ctx context.Context, cfg *config.Config, cfgPath string, clock
  
  	// The SDM user token cannot read Pub/Sub — sdm.service is the only scope the
@@ -315,3 +324,253 @@ index 0d22c56..e8bd5e8 100644
  func (s *Subscriber) dispatch(raw []byte) {
  	if s.log().Enabled(context.Background(), slog.LevelDebug) {
  		device, names := summarize(raw)
+diff --git a/internal/media/nestunifi.go b/internal/media/nestunifi.go
+new file mode 100644
+index 0000000..22f8a1c
+--- /dev/null
++++ b/internal/media/nestunifi.go
+@@ -0,0 +1,73 @@
++package media
++
++import (
++	"log/slog"
++	"sync/atomic"
++
++	"github.com/pion/rtp"
++	"github.com/pion/webrtc/v4"
++
++	"github.com/ceb3/nest-to-ONVIF/internal/config"
++	"github.com/ceb3/nest-to-ONVIF/internal/session"
++)
++
++// SoundSuffix follows a camera's path to name the path its sound is published on.
++const SoundSuffix = "-audio"
++
++// sounded publishes a camera's video on its own path, exactly as without sound, and its sound on a second path.
++// A recorder reads the camera's path and UniFi Protect does not accept Opus, so the sound stays out of it.
++// Whatever happens to the sound, the video goes on.
++type sounded struct {
++	video, sound *Publisher
++	silent       atomic.Bool
++	log          *slog.Logger
++}
++
++var (
++	_ session.TrackSink    = (*sounded)(nil)
++	_ session.SinkCloser   = (*sounded)(nil)
++	_ session.SinkReporter = (*sounded)(nil)
++)
++
++// WithSound gives the publisher of one camera connection. A camera configured with audio keeps both on one path.
++func WithSound(cam config.Camera, baseURL string) (session.TrackSink, error) {
++	video, err := NewPublisher(cam, baseURL)
++	if err != nil {
++		return nil, err
++	}
++	if cam.Audio {
++		return video, nil
++	}
++	beside := cam
++	beside.Name += SoundSuffix
++	sound, err := NewPublisher(beside, baseURL)
++	if err != nil {
++		return nil, err
++	}
++	sound.wantAudio, sound.soundOnly = true, true
++	return &sounded{video: video, sound: sound, log: sound.log}, nil
++}
++
++func (s *sounded) WriteRTP(info session.TrackInfo, pkt *rtp.Packet) error {
++	if info.Kind != webrtc.RTPCodecTypeAudio {
++		return s.video.WriteRTP(info, pkt)
++	}
++	if s.silent.Load() {
++		return nil
++	}
++	if err := s.sound.WriteRTP(info, pkt); err != nil && !s.silent.Swap(true) {
++		s.log.Warn("sound is not published for this connection; video goes on", "error", err)
++		_ = s.sound.Close()
++	}
++	return nil
++}
++
++// SinkStats reports the video alone: a connection is judged by its video.
++func (s *sounded) SinkStats() session.SinkStats {
++	return s.video.SinkStats()
++}
++
++func (s *sounded) Close() error {
++	_ = s.sound.Close()
++	return s.video.Close()
++}
+diff --git a/internal/media/nestunifi_test.go b/internal/media/nestunifi_test.go
+new file mode 100644
+index 0000000..30a4cee
+--- /dev/null
++++ b/internal/media/nestunifi_test.go
+@@ -0,0 +1,135 @@
++package media_test
++
++import (
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/bluenviron/gortsplib/v5"
++	"github.com/bluenviron/gortsplib/v5/pkg/base"
++	"github.com/bluenviron/gortsplib/v5/pkg/description"
++	"github.com/bluenviron/gortsplib/v5/pkg/format"
++	"github.com/pion/rtp"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/ceb3/nest-to-ONVIF/internal/config"
++	"github.com/ceb3/nest-to-ONVIF/internal/media"
++	"github.com/ceb3/nest-to-ONVIF/internal/session"
++)
++
++// paths records what every path of a test server was given. A refused path answers its ANNOUNCE with an error.
++type paths struct {
++	mu      sync.Mutex
++	medias  map[string][]description.MediaType
++	packets map[string]int
++	refused string
++}
++
++func (p *paths) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if ctx.Path == p.refused {
++		return &base.Response{StatusCode: base.StatusNotFound}, assert.AnError
++	}
++	for _, medium := range ctx.Description.Medias {
++		p.medias[ctx.Path] = append(p.medias[ctx.Path], medium.Type)
++	}
++	return &base.Response{StatusCode: base.StatusOK}, nil
++}
++
++func (p *paths) OnSetup(*gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
++	return &base.Response{StatusCode: base.StatusOK}, nil, nil
++}
++
++func (p *paths) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
++	path := ctx.Path
++	ctx.Session.OnPacketRTPAny(func(*description.Media, format.Format, *rtp.Packet) {
++		p.mu.Lock()
++		p.packets[path]++
++		p.mu.Unlock()
++	})
++	return &base.Response{StatusCode: base.StatusOK}, nil
++}
++
++func (p *paths) seen(path string) ([]description.MediaType, int) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.medias[path], p.packets[path]
++}
++
++func soundServer(t *testing.T, refused string) (string, *paths) {
++	t.Helper()
++	seen := &paths{medias: map[string][]description.MediaType{}, packets: map[string]int{}, refused: refused}
++	server := &gortsplib.Server{Handler: seen, RTSPAddress: "127.0.0.1:0"}
++	require.NoError(t, server.Start())
++	t.Cleanup(server.Close)
++	return "rtsp://" + server.NetListener().Addr().String(), seen
++}
++
++func send(t *testing.T, sink session.TrackSink, track session.TrackInfo, payloadType uint8, sequence uint16) {
++	t.Helper()
++	require.NoError(t, sink.WriteRTP(track, &rtp.Packet{
++		Header:  rtp.Header{PayloadType: payloadType, SequenceNumber: sequence},
++		Payload: []byte{0x65},
++	}))
++}
++
++func TestSoundIsPublishedBesideTheVideo(t *testing.T) {
++	baseURL, seen := soundServer(t, "")
++	sink, err := media.WithSound(config.Camera{Name: "Backyard"}, baseURL)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = sink.(session.SinkCloser).Close() })
++
++	for sequence := uint16(0); sequence < 3; sequence++ {
++		send(t, sink, videoTrack, 96, sequence)
++		send(t, sink, audioTrack, 111, sequence)
++	}
++	require.Eventually(t, func() bool {
++		_, video := seen.seen("/cam-backyard")
++		_, sound := seen.seen("/cam-backyard-audio")
++		return video == 3 && sound == 3
++	}, 2*time.Second, 10*time.Millisecond)
++	video, _ := seen.seen("/cam-backyard")
++	sound, _ := seen.seen("/cam-backyard-audio")
++	assert.Equal(t, []description.MediaType{description.MediaTypeVideo}, video)
++	assert.Equal(t, []description.MediaType{description.MediaTypeAudio}, sound)
++	assert.Equal(t, uint64(3), sink.(session.SinkReporter).SinkStats().Published)
++}
++
++func TestVideoGoesOnWhenTheSoundIsRefused(t *testing.T) {
++	baseURL, seen := soundServer(t, "/cam-backyard-audio")
++	sink, err := media.WithSound(config.Camera{Name: "Backyard"}, baseURL)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = sink.(session.SinkCloser).Close() })
++
++	for sequence := uint16(0); sequence < 3; sequence++ {
++		send(t, sink, audioTrack, 111, sequence)
++		send(t, sink, videoTrack, 96, sequence)
++	}
++	require.Eventually(t, func() bool {
++		_, video := seen.seen("/cam-backyard")
++		return video == 3
++	}, 2*time.Second, 10*time.Millisecond)
++	medias, sound := seen.seen("/cam-backyard-audio")
++	assert.Empty(t, medias)
++	assert.Zero(t, sound)
++	assert.Zero(t, sink.(session.SinkReporter).SinkStats().Failed)
++}
++
++func TestCameraConfiguredWithAudioKeepsOnePath(t *testing.T) {
++	baseURL, seen := soundServer(t, "")
++	sink, err := media.WithSound(config.Camera{Name: "Backyard", Audio: true}, baseURL)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = sink.(session.SinkCloser).Close() })
++
++	send(t, sink, videoTrack, 96, 0)
++	send(t, sink, audioTrack, 111, 0)
++	send(t, sink, videoTrack, 96, 1)
++	require.Eventually(t, func() bool {
++		medias, _ := seen.seen("/cam-backyard")
++		return len(medias) == 2
++	}, 2*time.Second, 10*time.Millisecond)
++	medias, _ := seen.seen("/cam-backyard-audio")
++	assert.Empty(t, medias)
++}
+diff --git a/internal/media/publisher.go b/internal/media/publisher.go
+index 8cd9dbc..1eb1519 100644
+--- a/internal/media/publisher.go
++++ b/internal/media/publisher.go
+@@ -55,6 +55,7 @@ type Publisher struct {
+ 	url         string
+ 	redactedURL string
+ 	wantAudio   bool
++	soundOnly   bool // This publisher carries a camera's sound on its own path. See WithSound.
+ 	log         *slog.Logger
+ 
+ 	mu         sync.Mutex
+@@ -337,7 +338,7 @@ func (p *Publisher) announceAfterGrace() {
+ 	if p.announced || p.announcing || p.closed {
+ 		return
+ 	}
+-	if p.video == nil {
++	if p.video == nil && !p.soundOnly {
+ 		// Video is essential. Announcing audio alone would permanently reject
+ 		// the video medium when it arrives, so start another grace interval.
+ 		p.videoWaits++
+@@ -422,7 +423,7 @@ func (p *Publisher) announceWithRetry(
+ }
+ 
+ func (p *Publisher) haveEveryExpectedTrack() bool {
+-	return p.video != nil && (!p.wantAudio || p.audio != nil)
++	return (p.video != nil || p.soundOnly) && (!p.wantAudio || p.audio != nil)
+ }
+ 
+ func (p *Publisher) mediumWasAnnounced(medium *description.Media) bool {

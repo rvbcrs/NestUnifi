@@ -45,6 +45,66 @@ class CameraChanges(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
 
+    def test_installation_from_before_the_mix_gets_sound_paths_and_a_mixer(self):
+        media = json.loads(json.dumps(self.media))
+        self.assertTrue(worker.prepare(media, self.bridge))
+        reader, publisher, mixer = media["authInternalUsers"]
+        self.assertEqual(reader, self.media["authInternalUsers"][0])
+        self.assertEqual(publisher["permissions"], [{"action": "publish", "path": "cam-keuken-camera"},
+                                                    {"action": "publish", "path": worker.SOUND}])
+        self.assertEqual((mixer["user"], len(mixer["pass"])), (worker.MIXER, 48))
+        self.assertEqual(set(media["paths"]), {"cam-keuken-camera", worker.SOUND})
+        self.assertFalse(worker.prepare(media, self.bridge))
+
+    def test_mix_shows_the_cameras_side_by_side_with_the_sound_of_those_that_have_it(self):
+        garden = dict(self.onvif["devices"][0], name="Tuin", uuid="garden-id", streams=[
+            dict(self.onvif["devices"][0]["streams"][0], rtsp="rtsp://test:fixture@mediamtx:8554/cam-tuin")])
+        self.onvif["devices"].append(garden)
+        worker.prepare(self.media, self.bridge)
+        self.media["paths"]["cam-tuin"] = {}
+        worker.ONVIF.write_text(json.dumps(self.onvif))
+        worker.MEDIA.write_text(json.dumps(self.media))
+        publishing = {"cam-keuken-camera", "cam-keuken-camera-audio", "cam-tuin", "mix"}
+        asked = []
+        def describe(path, username, password, timeout=6):
+            asked.append((path, username))
+            return 200 if path in publishing else 404
+        with patch.object(worker, "describe", describe), patch.object(time, "sleep"):
+            for wrong in (["fixed-id"], ["fixed-id", "fixed-id"], ["fixed-id"] * 5, "fixed-id", None):
+                with self.assertRaisesRegex(worker.Problem, "twee tot vier"):
+                    worker.mix({"ids": wrong})
+            self.assertEqual(worker.mix({"ids": ["fixed-id", "garden-id"]}),
+                             {"url": "/live/mix/index.m3u8", "silent": ["Tuin"]})
+            route = worker.read(worker.MEDIA)["paths"]["mix"]
+            command = route["runOnDemand"].split(" ")
+            secret = self.media["authInternalUsers"][-1]["pass"]
+            source = "rtsp://%s:%s@127.0.0.1:8554/" % (worker.MIXER, secret)
+            self.assertEqual([command[i + 1] for i, arg in enumerate(command) if arg == "-i"],
+                             [source + path for path in ("cam-keuken-camera", "cam-tuin", "cam-keuken-camera-audio")])
+            graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("[v0][v1]xstack=inputs=2:layout=0_0|640_0:fill=black:shortest=1[v]", graph)
+            self.assertIn("[2:a]amix=inputs=1:duration=shortest:normalize=0[a]", graph)
+            self.assertEqual(command[-1], source + "mix")
+            self.assertEqual(asked[-1], ("mix", worker.MIXER))
+            # The same choice again leaves the file alone, so a running mix goes on.
+            written = worker.MEDIA.stat().st_mtime_ns
+            worker.mix({"ids": ["fixed-id", "garden-id"]})
+            self.assertEqual(worker.MEDIA.stat().st_mtime_ns, written)
+            publishing.remove("mix")
+            with self.assertRaisesRegex(worker.Problem, "niet gestart"):
+                worker.mix({"ids": ["fixed-id", "garden-id"]})
+            publishing.remove("cam-tuin")
+            with self.assertRaisesRegex(worker.Problem, "geen video van Tuin"):
+                worker.mix({"ids": ["fixed-id", "garden-id"]})
+        four = worker.mix_command(["a", "b", "c", "d"], [], "rtsp://x/")
+        self.assertIn("layout=0_0|640_0|0_360|640_360", four[four.index("-filter_complex") + 1])
+        self.assertNotIn("-c:a", four)
+        self.assertFalse(any(" " in arg for arg in four))
+        # A password with a space would add arguments of its own to the command.
+        for unsafe in ("x -f null", "x'y", 'x"y', "x\\y", "x\ty"):
+            with self.assertRaisesRegex(worker.Problem, "beschadigd"):
+                worker.mix_command(["a", "b"], [], "rtsp://mixer:%s@127.0.0.1:8554/" % unsafe)
+
     def test_camera_server_config_uses_onvif_fields(self):
         cam = dict(self.onvif["devices"][0], kind="DISPLAY", display_name="Woonkamer",
                    info=worker.product_info({"firmware": "1"}, "DISPLAY"))

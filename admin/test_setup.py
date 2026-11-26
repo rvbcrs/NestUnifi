@@ -116,10 +116,13 @@ class Wizard(unittest.TestCase):
         self.assertEqual(cam["info"], {"firmware": "NestUnifi", "manufacturer": "Google", "model": "Nest Cam"})
         bridge, media = worker.read(worker.BRIDGE), worker.read(worker.MEDIA)
         self.assertEqual(bridge["cameras"][0]["event"], {"linger": "60s"})
-        publisher, reader = media["authInternalUsers"]
+        publisher, mixer, reader = media["authInternalUsers"]
         self.assertIn(":" + publisher["pass"] + "@", bridge["media"]["rtsp_base_url"])
-        self.assertEqual(publisher["permissions"], [{"action": "publish", "path": path}])
+        # The bridge publishes the camera and, beside it, the sound of every camera. Only the mixer reads that.
+        self.assertEqual(publisher["permissions"], [{"action": "publish", "path": worker.SOUND}, {"action": "publish", "path": path}])
         self.assertEqual(reader["permissions"], [{"action": "read", "path": path}])
+        self.assertEqual(mixer["user"], worker.MIXER)
+        self.assertEqual(set(media["paths"]), {worker.SOUND, path})
         self.assertEqual(self.ask("setup")["cameras"], 1)
 
     def test_link_check_follows_google_and_relinking_restarts_the_bridge(self):
@@ -175,6 +178,13 @@ class Wizard(unittest.TestCase):
                 self.ask("restore", backup=broken)
         with self.assertRaisesRegex(worker.Problem, "onvolledig"):
             self.ask("restore", backup={"nestunifi": 1, "files": dict(saved["files"], **{"admin/notify.json": {"url": "file:///etc/passwd"}})})
+        # The mixer's password becomes part of a command line, so only the kind NestUnifi makes itself comes back.
+        unsafe = json.loads(json.dumps(saved))
+        for user in unsafe["files"]["media/mediamtx.yml"]["authInternalUsers"]:
+            if user["user"] == worker.MIXER:
+                user["pass"] = "x -f null -y /state/private/owned"
+        with self.assertRaisesRegex(worker.Problem, "onvolledig"):
+            self.ask("restore", backup=unsafe)
         self.assertFalse(worker.TOKENS.exists())
         # A hook in the media configuration would run a command. Only NestUnifi's own fields come back.
         media = saved["files"]["media/mediamtx.yml"]

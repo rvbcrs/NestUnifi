@@ -132,7 +132,10 @@ class Routes(unittest.TestCase):
             self.assertEqual(self.request("GET", "/live/cam-a/index.m3u8"), (200, b"#EXTM3U\n"))
             self.assertEqual(self.request("GET", "/live/cam-b/index.m3u8")[0], 404)
             self.assertEqual(self.request("GET", "/live/cam-a/../x.m3u8")[0], 404)
-        self.assertEqual(Media.asked, [("/cam-a/index.m3u8", "Bearer k3y"), ("/cam-b/index.m3u8", "Bearer k3y")])
+            self.assertEqual(self.request("GET", "/live/mix/index.m3u8")[0], 404)  # The camera mix, not running here.
+            self.assertEqual(self.request("GET", "/live/mixer/index.m3u8")[0], 404)
+        self.assertEqual(Media.asked, [("/cam-a/index.m3u8", "Bearer k3y"), ("/cam-b/index.m3u8", "Bearer k3y"),
+                                       ("/mix/index.m3u8", "Bearer k3y")])
 
 
 if __name__ == "__main__":

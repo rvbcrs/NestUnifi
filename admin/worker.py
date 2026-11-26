@@ -58,6 +58,11 @@ BACKUP = {"bridge/config.yaml": (BRIDGE, 10001), "bridge/tokens.json": (TOKENS, 
 # The detections a webhook can hear about, with the message for each.
 KINDS = {"chime": "Er wordt aangebeld bij %s.", "person": "Persoon gezien bij %s.", "motion": "Beweging bij %s."}
 HOLD = 300  # A problem is reported once it has lasted this many seconds.
+# The bridge publishes every camera's sound on a path of its own, beside the video. A recorder reads the camera's
+# path and never meets the sound: UniFi Protect does not accept Opus.
+SOUND = "~^cam-[a-z0-9-]+-audio$"
+MIX = "mix"  # The path of the combined picture, and what its sound path is called after a camera's.
+MIXER = "nestunifi-mixer"  # The media server user that reads the cameras and publishes the mix.
 
 
 class Problem(Exception):
@@ -171,16 +176,19 @@ def set_reader(cam, media, password, adding=False):
     st["rtsp"] = uri._replace(netloc=quote(username, safe="")+":"+quote(password, safe="")+"@"+uri.netloc.rsplit("@", 1)[-1]).geturl()
 
 
-def reader_status(cam, password, timeout=6):
-    path = stream_path(cam)
-    credentials = (cam["auth"]["username"] + ":" + password).encode()
-    basic = base64.b64encode(credentials).decode()
+def describe(path, username, password, timeout=6):
+    """Ask the media server for a path as this user: 200 with a publisher, 404 without, 401 when refused."""
+    basic = base64.b64encode((username + ":" + password).encode()).decode()
     query = (f"DESCRIBE rtsp://mediamtx:8554/{path} RTSP/1.0\r\nCSeq: 1\r\n"
              f"Accept: application/sdp\r\nAuthorization: Basic {basic}\r\n\r\n")
     with socket.create_connection(("127.0.0.1", 8554), timeout=timeout) as conn:
         conn.sendall(query.encode())
         with conn.makefile("rb") as response:
             return int(response.readline(256).split()[1])
+
+
+def reader_status(cam, password, timeout=6):
+    return describe(stream_path(cam), cam["auth"]["username"], password, timeout)
 
 
 def confirm_reader(cam, former_password):
@@ -599,6 +607,83 @@ def test_stream(req):
     return {"live": False}
 
 
+def prepare(media, bridge):
+    """Give the media server what the camera mix needs: the sound paths, the bridge's right to publish on them and
+    a user for the mixer. Tells whether anything was missing."""
+    before = copy.deepcopy(media)
+    media["paths"].setdefault(SOUND, {})
+    publisher = urlsplit(bridge["media"]["rtsp_base_url"]).username
+    rule = {"action": "publish", "path": SOUND}
+    users = media["authInternalUsers"]
+    for user in users:
+        publishes = any(r["action"] == "publish" and r["path"].startswith("cam-") for r in user["permissions"])
+        if (publishes or user.get("user") == publisher) and rule not in user["permissions"]:
+            user["permissions"].append(rule)
+    if not any(user.get("user") == MIXER for user in users):
+        users.append({"user": MIXER, "pass": secrets.token_hex(24), "permissions": [
+            {"action": "read", "path": "~^cam-[a-z0-9-]+$"}, {"action": "read", "path": MIX},
+            {"action": "publish", "path": MIX}]})
+    return media != before
+
+
+def mix_command(videos, sounds, source):
+    """The ffmpeg that the media server runs while someone watches the mix. Every camera gets a tile of 640 by 360,
+    two to a row, and the sound of all of them becomes one track.
+
+    No argument holds a space: the media server splits the line on them.
+    """
+    args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    for path in videos + sounds:
+        # Every source counts time from its first packet. Opening them without a look ahead keeps those moments
+        # together, so no camera runs behind the others.
+        args += ["-rtsp_transport", "tcp", "-analyzeduration", "0", "-i", source + path]
+    count = len(videos)
+    graph = ["[%d:v]fps=15,scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,"
+             "setsar=1[v%d]" % (i, i) for i in range(count)]
+    graph.append("".join("[v%d]" % i for i in range(count)) + "xstack=inputs=%d:layout=%s:fill=black:shortest=1[v]" % (
+        count, "|".join("%d_%d" % (i % 2 * 640, i // 2 * 360) for i in range(count))))
+    args += ["-map", "[v]", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+             "-g", "30", "-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3000k"]
+    if sounds:
+        graph.append("".join("[%d:a]" % (count + i) for i in range(len(sounds)))
+                     + "amix=inputs=%d:duration=shortest:normalize=0[a]" % len(sounds))
+        args += ["-map", "[a]", "-c:a", "aac", "-b:a", "96k", "-ac", "2"]
+    # A source that ends, ends the mix. The page asks for it again, and that starts it with every source anew.
+    args += ["-filter_complex", ";".join(graph), "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", source + MIX]
+    # The password in the source comes from a file that a backup can replace. It must not add an argument.
+    if any(re.search(r"[\s'\"\\]", arg) for arg in args):
+        raise Problem("De instellingen van de mediaserver zijn beschadigd. Het samenvoegen start niet.")
+    return args
+
+
+def mix(req):
+    """A trial: two to four cameras in one picture with one sound track. It exists while someone watches it."""
+    ids = req.get("ids")
+    if not isinstance(ids, list) or not 2 <= len(ids) <= 4 or len(set(map(str, ids))) != len(ids):
+        raise Problem("Kies twee tot vier camera's.")
+    onvif, media = read(ONVIF), read(MEDIA)
+    cams = [camera(onvif, camera_id) for camera_id in ids]
+    for cam in cams:
+        if cam.get("paused") or source_live(cam) is not True:
+            raise Problem("De bridge ontvangt geen video van " + display(cam) + ".")
+    password = next(user["pass"] for user in media["authInternalUsers"] if user.get("user") == MIXER)
+    heard = [cam for cam in cams if describe(stream_path(cam) + "-audio", MIXER, password) == 200]
+    command = mix_command([stream_path(cam) for cam in cams], [stream_path(cam) + "-audio" for cam in heard],
+                          "rtsp://%s:%s@127.0.0.1:8554/" % (MIXER, password))
+    route = {"runOnDemand": " ".join(command), "runOnDemandStartTimeout": "40s", "runOnDemandCloseAfter": "10s"}
+    if media["paths"].get(MIX) != route:
+        media["paths"][MIX] = route
+        replace(MEDIA, media)
+        time.sleep(1.2)  # MediaMTX coalesces configuration events within one second.
+    try:  # Asking for the path starts the mix. The answer comes once it gives a picture.
+        started = describe(MIX, MIXER, password, timeout=45) == 200
+    except (OSError, ValueError, IndexError):
+        started = False
+    if not started:
+        raise Problem("Het samenvoegen is niet gestart. Download de diagnose onder het tandwiel om te zien waarom.")
+    return {"url": "/live/" + MIX + "/index.m3u8", "silent": [display(cam) for cam in cams if cam not in heard]}
+
+
 def bootstrap():
     """Write the configuration of a new installation. An existing installation is never rewritten.
 
@@ -608,17 +693,17 @@ def bootstrap():
     if BRIDGE.exists():
         return
     secret = secrets.token_hex(24)
-    for path, uid, value in [
-            (MEDIA, 10002, {"logLevel": "info", "authMethod": "internal",
-                            "authInternalUsers": [{"user": "bridge", "pass": secret, "ips": [], "permissions": []}],
-                            "api": False, "metrics": False, "pprof": False, "playback": False,
-                            "rtsp": True, "rtspTransports": ["tcp"], "rtmp": False, "webrtc": False,
-                            "srt": False, "moq": False, "hls": True, "hlsVariant": "mpegts",
-                            "hlsAlwaysRemux": False, "hlsMuxerCloseAfter": "60s", "hlsAllowOrigins": [],
-                            "hlsCDNSecret": secrets.token_hex(32), "paths": {}}),
-            (ONVIF, 0, None), (SETUP, 0, None),
-            (BRIDGE, 10001, {"google": {}, "media": {"rtsp_base_url": "rtsp://bridge:"+secret+"@127.0.0.1:8554"},
-                             "events": {"onvif": False}, "viewer": {"listen": "off"}, "cameras": []})]:
+    bridge = {"google": {}, "media": {"rtsp_base_url": "rtsp://bridge:"+secret+"@127.0.0.1:8554"},
+              "events": {"onvif": False}, "viewer": {"listen": "off"}, "cameras": []}
+    media = {"logLevel": "info", "authMethod": "internal",
+             "authInternalUsers": [{"user": "bridge", "pass": secret, "ips": [], "permissions": []}],
+             "api": False, "metrics": False, "pprof": False, "playback": False,
+             "rtsp": True, "rtspTransports": ["tcp"], "rtmp": False, "webrtc": False,
+             "srt": False, "moq": False, "hls": True, "hlsVariant": "mpegts",
+             "hlsAlwaysRemux": False, "hlsMuxerCloseAfter": "60s", "hlsAllowOrigins": [],
+             "hlsCDNSecret": secrets.token_hex(32), "paths": {}}
+    prepare(media, bridge)
+    for path, uid, value in [(MEDIA, 10002, media), (ONVIF, 0, None), (SETUP, 0, None), (BRIDGE, 10001, bridge)]:
         path.parent.mkdir(parents=True, exist_ok=True)
         os.chown(path.parent, uid, uid)
         os.chmod(path.parent, 0o700)
@@ -939,7 +1024,7 @@ def restored(files):
                    "permissions": [{"action": r["action"], "path": r["path"]} for r in u["permissions"]]},
                   **({"ips": list(u["ips"])} if "ips" in u else {}))
              for u in media["authInternalUsers"]]
-    paths = {path: {} for path in media["paths"]}
+    paths = {path: {} for path in media["paths"]}  # The mix comes back without its command. The next one writes it.
     devices = [{k: v for k, v in c.items() if k in DEVICE_KEYS} for c in onvif["devices"]]
     text = lambda *values: all(isinstance(v, str) for v in values)
     published = {"cam-" + slug(c["name"]) for c in cameras}
@@ -949,13 +1034,17 @@ def restored(files):
                        and re.fullmatch(r"127\.0\.0\.\d{1,3}", c["onvif"]["ip"]) for c in cameras)
             or not all(text(u["user"], u["pass"], *u.get("ips", [])) and all(r["action"] in ("read", "publish") and text(r["path"])
                                                          for r in u["permissions"]) for u in users)
-            or not all(re.fullmatch(r"cam-[a-z0-9-]+", path) for path in paths)
+            or not all(path in (SOUND, MIX) or re.fullmatch(r"cam-[a-z0-9-]+", path) for path in paths)
+            # The mixer's password becomes part of a command line.
+            or not all(re.fullmatch(r"[0-9a-f]{48}", u["pass"]) for u in users if u["user"] == MIXER)
             or not all(c.get("paused", True) is True for c in devices)
             or {stream_path(c) for c in devices} != published or not published <= paths.keys()):
         raise TypeError
-    return (dict(read(BRIDGE), google=google, media={"rtsp_base_url": base.geturl()}, cameras=cameras,
-                 events={"onvif": bool(bridge.get("events", {}).get("onvif"))}),
-            dict(read(MEDIA), authInternalUsers=users, paths=paths), {"devices": devices})
+    bridge = dict(read(BRIDGE), google=google, media={"rtsp_base_url": base.geturl()}, cameras=cameras,
+                  events={"onvif": bool(bridge.get("events", {}).get("onvif"))})
+    media = dict(read(MEDIA), authInternalUsers=users, paths=paths)
+    prepare(media, bridge)  # A backup from before the camera mix.
+    return bridge, media, {"devices": devices}
 
 
 def restore(req):
@@ -1014,6 +1103,8 @@ def dispatch(req):
         return setup(action, req)
     if action == "motiontest":
         return motion_test(req)
+    if action == "mix":
+        return mix(req)
     if action in ("notify", "notifytest"):
         return notify(action, req)
     if action == "backup":
@@ -1047,6 +1138,9 @@ if __name__ == "__main__":
     os.umask(0o077)
     bootstrap()
     recover()
+    media = read(MEDIA)
+    if prepare(media, read(BRIDGE)):  # An installation from before the camera mix.
+        replace(MEDIA, media)
     CONTROL.parent.mkdir(mode=0o711, exist_ok=True)
     CONTROL.parent.chmod(0o711)
     CONTROL.unlink(missing_ok=True)

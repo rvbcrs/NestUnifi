@@ -192,7 +192,8 @@ async function watch(cam, reconnect = true) {
   el("cancel").hidden = true;
   const media = make("video");
   video = media;
-  media.controls = media.autoplay = media.muted = media.playsInline = true;
+  media.controls = media.autoplay = media.playsInline = true;
+  media.muted = !cam.mix;
   media.setAttribute("aria-label", "Livebeeld van " + cam.name);
   const retry = button("Opnieuw proberen", () => watch(cam));
   retry.className = "quiet retry";
@@ -203,7 +204,7 @@ async function watch(cam, reconnect = true) {
     stopPlayback();
     media.hidden = true;
     retry.hidden = false;
-    message("modalMessage", text || "De bridge ontvangt geen video van " + cam.name + ". Controleer het livebeeld van dit apparaat in Google Home.", true);
+    message("modalMessage", text || (cam.mix ? "Het samengevoegde beeld is gestopt." : "De bridge ontvangt geen video van " + cam.name + ". Controleer het livebeeld van dit apparaat in Google Home."), true);
   }
   function interrupted() {
     if (epoch !== modalEpoch || video !== media) return;
@@ -227,11 +228,14 @@ async function watch(cam, reconnect = true) {
     startupTimer = setTimeout(interrupted, 45000);
   };
   media.onerror = interrupted;
-  message("modalMessage", "Verbinding maken met " + cam.name + "…");
-  startupTimer = setTimeout(interrupted, 45000);
+  message("modalMessage", cam.mix ? "Camera’s samenvoegen. Dit duurt enkele seconden…" : "Verbinding maken met " + cam.name + "…");
+  startupTimer = setTimeout(interrupted, 60000);
   try {
-    const {url} = await api("view", {id: cam.id});
+    const {url, silent = []} = await (cam.mix ? api("mix", {ids: cam.mix}) : api("view", {id: cam.id}));
     if (epoch !== modalEpoch || video !== media) return;
+    clearTimeout(startupTimer);
+    startupTimer = setTimeout(interrupted, 45000);
+    if (silent.length) el("fields").append(make("p", "Geen geluid van " + silent.join(", ") + "."));
     if (window.Hls && Hls.isSupported()) {
       player = new Hls({enableWorker: false, lowLatencyMode: false});
       player.on(Hls.Events.ERROR, (_, data) => {
@@ -240,6 +244,8 @@ async function watch(cam, reconnect = true) {
       });
       player.loadSource(url);
       player.attachMedia(media);
+      // A browser may refuse to start a video with sound on its own. Then it starts silent, with the sound one click away.
+      if (cam.mix) media.play().catch(() => { media.muted = true; media.play().catch(() => {}); });
     } else if (media.canPlayType("application/vnd.apple.mpegurl")) {
       media.src = url;
     } else {
@@ -706,13 +712,39 @@ function renderBackup(s) {
     make("h2", "Hulp bij een probleem"), make("p", "Het diagnosebestand bevat de versie, de toestand van elk onderdeel en de laatste logregels. Wachtwoorden, sleutels en de koppeling met Google staan er niet in; de namen en netwerkadressen van je camera’s wel. Voeg het toe als je een probleem meldt."),
     download("Diagnose downloaden", "diagnose", "diagnose"), note);
 }
+// A trial: several cameras side by side in one picture, with the sound of all of them in one track.
+function showMix() {
+  const form = el("mixForm"), note = make("p", undefined, "message"), row = submit("Samenvoegen");
+  note.setAttribute("role", "status");
+  const checks = devices.filter(cam => !cam.paused).map(cam => {
+    const label = make("label", undefined, "pick"), check = make("input");
+    check.type = "checkbox";
+    check.value = cam.id;
+    check.disabled = !cam.live;
+    label.append(check, cam.name + (cam.live ? "" : " · geen beeld"));
+    return label;
+  });
+  form.replaceChildren(make("p", "Kies twee tot vier camera’s. NestUnifi zet ze naast elkaar in één beeld en mengt hun geluid. Het samenvoegen kost rekenkracht zolang je kijkt en stopt een minuut nadat je het beeld sluit. Je camera’s in UniFi Protect merken er niets van."), ...checks, row, note);
+  form.onsubmit = e => {
+    e.preventDefault();
+    const ids = checks.map(label => label.firstChild).filter(check => check.checked).map(check => check.value);
+    const fits = ids.length >= 2 && ids.length <= 4;
+    note.textContent = fits ? "" : "Kies twee tot vier camera’s.";
+    note.classList.toggle("error", !fits);
+    if (fits) watch({name: "Samengevoegd beeld", mix: ids});
+  };
+  el("overview").hidden = true;
+  el("mix").hidden = false;
+}
+el("openMix").onclick = showMix;
+el("mixClose").onclick = () => showOverview().catch(e => message("notice", e.message, true));
 function showSetup(note) {
   el("overview").hidden = true;
   el("setup").hidden = false;
   renderSetup(note);
 }
 function showOverview() {
-  el("setup").hidden = true;
+  el("setup").hidden = el("mix").hidden = true;
   el("overview").hidden = false;
   return refresh();
 }

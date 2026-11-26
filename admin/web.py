@@ -17,7 +17,7 @@ MEDIA = "http://127.0.0.1:8888/"
 MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
-ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest",
+ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest", "mix",
            "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose"}
 # Google returns the browser to /oauth2callback with the code in the query. The page itself hands it in.
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/oauth2callback": ("index.html", "text/html; charset=utf-8"),
@@ -25,7 +25,7 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/oauth2callback": ("
 for asset in (ASSETS / "assets").glob("*.svg"):
     STATIC["/assets/" + asset.name] = ("assets/" + asset.name, "image/svg+xml")
 STATIC["/assets/hls.light.min.js"] = ("assets/hls.light.min.js", "text/javascript")
-LIVE = re.compile(r"/live/(cam-[a-z0-9-]+)/([A-Za-z0-9_-]+\.(?:m3u8|ts))")
+LIVE = re.compile(r"/live/(cam-[a-z0-9-]+|mix)/([A-Za-z0-9_-]+\.(?:m3u8|ts))")
 # Every camera has a private listener inside the container, numbered 1 to 254, that gives its latest image.
 STILL = re.compile(r"/snapshot/([1-9]\d{0,2})\.jpg(?:\?\d{1,16})?")
 STILL_SOURCE = "http://127.0.0.%d/trigger/snapshot"
