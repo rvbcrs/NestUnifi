@@ -165,7 +165,8 @@ class Endpoint:
     def __init__(self, cam, motion_ip, lan):
         self.cam = cam
         self.lan = lan
-        self.dev = "cam" + cam["mac"].lower().replace(":", "")
+        # At most 13 characters: the address check of the DHCP client (-a) quietly passes with a longer name.
+        self.dev = "c" + cam["mac"].lower().replace(":", "")
         self.uid = 20000 + cam["ports"]["soap"]
         self.path = Path("/run/endpoints") / (self.dev + ".json")
         self.lease = LEASES / self.dev

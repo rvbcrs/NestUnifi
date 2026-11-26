@@ -230,6 +230,11 @@ class CameraChanges(unittest.TestCase):
             runtime.ADDRESSES.write_text("[")
             self.assertEqual(runtime.remembered(), {})
 
+    def test_interface_name_fits_the_address_check_of_the_dhcp_client(self):
+        with patch.object(runtime.Endpoint, "configure"):
+            self.assertEqual(runtime.Endpoint({"mac": "02:9C:9c:6e:1d:3e", "name": "x", "ports": {"soap": 18081}}, "", "eth0").dev,
+                             "c029c9c6e1d3e")
+
     def test_service_output_is_passed_on_and_kept(self):
         with patch.object(runtime, "LOG", Path("log.txt")), patch.object(runtime.sys, "stdout", io.StringIO()) as shown:
             runtime.spawn(["sh", "-c", "echo started; echo failed >&2"]).wait()
