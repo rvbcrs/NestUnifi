@@ -41,6 +41,22 @@ def cast_key(path):
     return hmac.new(MEDIA_KEY.encode(), path.encode(), "sha256").hexdigest()
 
 
+def held_back(playlist, hold=6.0):
+    """A cast device plays a live stream a few seconds behind its newest piece. With short pieces it then waits for
+    the next one time after time, and shows that it is loading. Leaving the newest pieces out of its playlist keeps
+    it this many seconds further back, at the cost of as much delay."""
+    lines = playlist.decode("utf-8", "replace").split("\n")
+    ends = [i for i, line in enumerate(lines) if line and not line.startswith("#")]
+    lengths = [float(line[8:].split(",")[0]) for line in lines if line.startswith("#EXTINF:")]
+    if not ends or len(lengths) != len(ends):  # The list of streams, not a playlist of pieces.
+        return playlist
+    keep, hidden = len(ends), 0.0
+    while keep > 1 and hidden < hold:
+        keep -= 1
+        hidden += lengths[keep]
+    return "\n".join(lines[:ends[keep - 1] + 1]).encode() + b"\n"
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "NestUnifi"
 
@@ -86,7 +102,9 @@ class Handler(BaseHTTPRequestHandler):
         request = urllib.request.Request(MEDIA + camera + "/" + part, headers={"Authorization": "Bearer " + MEDIA_KEY})
         try:
             with direct.open(request, timeout=20) as source:
-                self.reply(200, source.read(), source.headers.get_content_type(), shared)
+                data = source.read()
+                self.reply(200, held_back(data) if shared and part.endswith(".m3u8") else data,
+                           source.headers.get_content_type(), shared)
         except urllib.error.HTTPError as exc:
             exc.close()
             self.reply(exc.code, {})

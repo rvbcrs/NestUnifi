@@ -110,6 +110,16 @@ class Routes(unittest.TestCase):
                 self.assertEqual(self.request("GET", outside)[0], 404, outside)
         self.assertEqual(Camera.asked, ["/7", "/7", "/8"])
 
+    def test_cast_device_plays_far_enough_behind_the_newest_piece(self):
+        piece = lambda n, length: "#EXT-X-PROGRAM-DATE-TIME:2026-11-27T21:42:%02d.000Z\n#EXTINF:%.5f,\nseg%d.ts\n" % (n, length, n)
+        playlist = lambda length, count: ("#EXTM3U\n#EXT-X-TARGETDURATION:%d\n" % length + "".join(piece(n, length) for n in range(count))).encode()
+        kept = lambda data: [line for line in web.held_back(data).decode().split("\n") if line.endswith(".ts")]
+        self.assertEqual(kept(playlist(2, 7)), ["seg0.ts", "seg1.ts", "seg2.ts", "seg3.ts"])
+        self.assertEqual(kept(playlist(8, 7)), ["seg%d.ts" % n for n in range(6)])
+        self.assertEqual(kept(playlist(2, 2)), ["seg0.ts"])  # A stream that has just started.
+        streams = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmain_stream.m3u8\n"
+        self.assertEqual(web.held_back(streams), streams)
+
     def test_live_video_comes_from_the_media_server_with_its_key(self):
         class Media(http.server.BaseHTTPRequestHandler):
             asked = []
