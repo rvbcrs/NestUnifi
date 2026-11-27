@@ -2,14 +2,20 @@
 import io
 import json
 import os
+import socketserver
+import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
+import cast
 import mixer
+import web
 import worker
 from suite import runtime
 from suite.runtime import device_config, lan_interface
@@ -313,6 +319,102 @@ class CameraChanges(unittest.TestCase):
         expected = dict(before["streams"][0], width=960, height=1280)
         self.assertEqual(updated, dict(before, streams=[expected]))
         self.assertEqual(worker.read(worker.BRIDGE), self.bridge)
+
+    def test_camera_with_video_gets_a_profile_of_its_own_shape_once(self):
+        cam = self.onvif["devices"][0]
+        state = {"cameras": {cam["uuid"]: {"online": True}}, "streams": {}}
+        measured, done, read = [], set(), worker.read
+        def measure(req):
+            measured.append(req["id"])
+            return {"live": True, "width": 1280, "height": 720}
+        size = lambda: [worker.read(worker.ONVIF)["devices"][0]["streams"][0][k] for k in ("width", "height")]
+        before = size()
+        with patch.multiple(worker, read=lambda p: state if p == worker.STATE else read(p), test_stream=measure):
+            worker.fit_profiles(done)  # No video yet.
+            self.assertEqual((measured, done), ([], set()))
+            state["streams"] = {"Keuken camera": {"state": "live"}}
+            worker.fit_profiles(done)  # The same shape in a smaller size: left alone.
+            self.assertEqual((measured, size()), ([cam["uuid"]], before))
+            worker.fit_profiles(done)
+            self.assertEqual(len(measured), 1)
+            measure = lambda req: {"live": True, "width": 960, "height": 1280}
+            with patch.object(worker, "test_stream", measure):
+                worker.fit_profiles(set())
+            self.assertEqual(size(), [960, 1280])
+
+    def test_cast_gives_the_device_an_address_the_page_serves_to_it(self):
+        cam = self.onvif["devices"][0]
+        worker.MEDIA.write_text(json.dumps(dict(self.media, hlsCDNSecret="k3y")))
+        played = []
+        ask = lambda address, origin="http://192.168.1.5:8780": worker.dispatch(
+            {"action": "cast", "id": cam["uuid"], "address": address, "origin": origin})
+        with patch.object(worker, "reader_status", return_value=200), patch.object(cast, "play", lambda *args: played.append(args)):
+            for wrong in (None, 7, "x", "8.8.8.8", "127.0.0.1"):
+                with self.assertRaisesRegex(worker.Problem, "Kies een cast-apparaat"):
+                    ask(wrong)
+            self.assertEqual((ask("192.168.1.30"), len(played)), ({}, 1))
+        address, url, title = played[0]
+        self.assertEqual((address, title, url.split("/cast/")[0]), ("192.168.1.30", "Keuken camera", "http://192.168.1.5:8780"))
+        path, key, part = web.CAST.fullmatch(urlsplit(url).path).groups()
+        with patch.object(web, "MEDIA_KEY", "k3y"):
+            self.assertEqual((path, key, part), ("cam-keuken-camera", web.cast_key(path), "index.m3u8"))
+        def refuse(*args):
+            raise cast.Refused("LOAD_FAILED")
+        with patch.object(worker, "reader_status", return_value=200), patch.object(cast, "play", refuse):
+            with self.assertRaisesRegex(worker.Problem, "speelt het beeld niet af\\.$"):
+                ask("192.168.1.30")
+            with self.assertRaisesRegex(worker.Problem, "via het IP-adres"):  # A cast device does not know a name of the home.
+                ask("192.168.1.30", "https://nest.example")
+
+    def test_cast_device_is_found_and_told_to_play_and_to_stop(self):
+        label = lambda name: b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+        record = lambda owner, kind, data: owner + struct.pack(">HHIH", kind, 1, 120, len(data)) + data
+        text = lambda *items: b"".join(bytes([len(item)]) + item.encode() for item in items)
+        service = b"\xc0\x0c"  # The rest of the name is at place 12 of the packet.
+        answer = (struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 2) + record(label(cast.SERVICE) + b"\0", 12, label("Hub") + service)
+                  + record(label("Hub") + service, 16, text("fn=Keuken Display", "md=Google Nest Hub", "ca=231941"))
+                  + record(label("Groep") + service, 16, text("fn=Alle speakers", "ca=199172")))  # Sound only.
+        self.assertEqual(cast.devices(answer, "192.168.1.30"),
+                         [{"name": "Keuken Display", "model": "Google Nest Hub", "address": "192.168.1.30"}])
+        heard = []
+        apps = [{"appId": cast.PLAYER, "transportId": "t-1", "sessionId": "s-1"}, {"appId": "other", "sessionId": "s-2"}]
+
+        class Device(socketserver.BaseRequestHandler):
+            def handle(self):
+                say = lambda namespace, data: self.request.sendall(cast.pack("receiver-0", "*", namespace, data))
+                while True:
+                    head = self.request.recv(4, 0x100)  # MSG_WAITALL
+                    if len(head) < 4:
+                        return
+                    namespace, data = cast.unpack(self.request.recv(struct.unpack(">I", head)[0], 0x100))
+                    heard.append((namespace.rsplit(".", 1)[1], data))
+                    if data["type"] in ("LAUNCH", "GET_STATUS", "STOP"):
+                        say(cast.HEARTBEAT, {"type": "PING"})
+                        say(cast.RECEIVER, {"type": "RECEIVER_STATUS", "requestId": 0, "status": {}})  # Told to everyone.
+                        say(cast.RECEIVER, {"type": "RECEIVER_STATUS", "requestId": data["requestId"], "status": {"applications": apps}})
+                    elif data["type"] == "LOAD":
+                        fine = "bad" not in data["media"]["contentId"]
+                        say(cast.MEDIA, {"type": "MEDIA_STATUS" if fine else "LOAD_FAILED", "requestId": data["requestId"]})
+        device = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Device)
+        device.daemon_threads = True
+        threading.Thread(target=device.serve_forever, daemon=True).start()
+        self.addCleanup(device.server_close)
+        self.addCleanup(device.shutdown)
+        reach = lambda address, timeout=None: cast.socket.socket.connect(s := cast.socket.socket(), device.server_address) or s
+        # No TLS here: the certificate of a cast device is its own and is not checked.
+        with patch.object(cast.socket, "create_connection", reach), \
+                patch.object(cast.ssl.SSLContext, "wrap_socket", lambda self, sock: sock):
+            cast.play("192.168.1.30", "http://nas/cast/a/index.m3u8", "Tuin")
+            self.assertEqual([data["type"] for _, data in heard], ["CONNECT", "LAUNCH", "PONG", "CONNECT", "LOAD"])
+            self.assertEqual(heard[-1][1]["media"], {
+                "contentId": "http://nas/cast/a/index.m3u8", "contentType": "application/x-mpegURL", "streamType": "LIVE",
+                "metadata": {"metadataType": 0, "title": "Tuin"}})
+            with self.assertRaises(cast.Refused):
+                cast.play("192.168.1.30", "http://nas/bad", "Tuin")
+            heard.clear()
+            cast.stop("192.168.1.30")
+            # Only our own player is ended.
+            self.assertEqual([data.get("sessionId", data["type"]) for _, data in heard], ["CONNECT", "GET_STATUS", "PONG", "s-1", "PONG"])
 
     def test_missing_source_is_independent_of_onvif_identity(self):
         cam = self.onvif["devices"][0]

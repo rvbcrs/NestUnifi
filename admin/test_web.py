@@ -134,8 +134,15 @@ class Routes(unittest.TestCase):
             self.assertEqual(self.request("GET", "/live/cam-a/../x.m3u8")[0], 404)
             self.assertEqual(self.request("GET", "/live/mix/index.m3u8")[0], 404)  # The camera mix, not running here.
             self.assertEqual(self.request("GET", "/live/mixer/index.m3u8")[0], 404)
+            # A cast device reads the same stream at an address with a key. Only there may any website read it.
+            self.assertIsNone(self.answer.getheader("Access-Control-Allow-Origin"))
+            self.assertEqual(self.request("GET", "/cast/cam-a/%s/index.m3u8" % web.cast_key("cam-a")), (200, b"#EXTM3U\n"))
+            self.assertEqual(self.answer.getheader("Access-Control-Allow-Origin"), "*")
+            self.assertEqual(self.request("GET", "/cast/cam-a/%s/index.m3u8" % web.cast_key("cam-b"))[0], 404)
+            with patch.object(web, "MEDIA_KEY", ""):
+                self.assertEqual(self.request("GET", "/cast/cam-a/%s/index.m3u8" % web.cast_key("cam-a"))[0], 404)
         self.assertEqual(Media.asked, [("/cam-a/index.m3u8", "Bearer k3y"), ("/cam-b/index.m3u8", "Bearer k3y"),
-                                       ("/mix/index.m3u8", "Bearer k3y")])
+                                       ("/mix/index.m3u8", "Bearer k3y"), ("/cam-a/index.m3u8", "Bearer k3y")])
 
 
 if __name__ == "__main__":

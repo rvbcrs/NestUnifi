@@ -204,6 +204,36 @@ function onSubmit(title, fn) {
   el("submit").hidden = false;
   submitAction = fn;
 }
+// Showing what the viewer shows on a cast device: a TV with Google TV, a Chromecast or a Nest Hub.
+function castRow(cam) {
+  const row = make("div", undefined, "cast"), note = make("p", undefined, "message"), choice = make("select");
+  note.setAttribute("role", "status");
+  choice.setAttribute("aria-label", "Cast-apparaat");
+  const say = (text, error = false) => { note.textContent = text; note.classList.toggle("error", error); };
+  const act = (text, done, fn) => async () => {
+    const buttons = row.querySelectorAll("button");
+    buttons.forEach(b => b.disabled = true);
+    say(text);
+    try { await fn(); say(done()); } catch (e) { say(e.message, true); }
+    buttons.forEach(b => b.disabled = false);
+  };
+  const chosen = () => choice.selectedOptions[0].textContent;
+  const start = button("Casten", act("Casten…", () => "Te zien op " + chosen() + ". Het beeld loopt daar enkele seconden achter.",
+    () => api("cast", {...(cam.trial ? {ids: cam.trial} : {id: cam.id}), address: choice.value})));
+  const stop = button("Stoppen", act("Stoppen…", () => "Gestopt op " + chosen() + ".", () => api("caststop", {address: choice.value})));
+  const search = button("Casten naar…", act("Cast-apparaten zoeken…", () => choice.options.length ? "" : "Geen cast-apparaat met een scherm gevonden.", async () => {
+    const {devices: found} = await api("castlist");
+    choice.replaceChildren(...found.map(device => {
+      const option = make("option", device.name);
+      option.value = device.address;
+      return option;
+    }));
+    if (found.length) row.replaceChildren(choice, start, stop, note);
+  }));
+  for (const b of [search, start, stop]) b.className = "quiet";
+  row.append(search, note);
+  return row;
+}
 async function watch(cam, reconnect = true) {
   const epoch = modal(cam.name);
   el("modal").classList.add("viewer");
@@ -255,6 +285,7 @@ async function watch(cam, reconnect = true) {
     clearTimeout(startupTimer);
     startupTimer = setTimeout(interrupted, 45000);
     if (silent.length) el("fields").append(make("p", "Geen geluid van " + silent.join(", ") + "."));
+    el("fields").append(castRow(cam));
     if (window.Hls && Hls.isSupported()) {
       player = new Hls({enableWorker: false, lowLatencyMode: false});
       player.on(Hls.Events.ERROR, (_, data) => {

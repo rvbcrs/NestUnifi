@@ -516,6 +516,21 @@ video {
 .retry {
   margin-top: 12px;
 }
+.cast {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.cast select {
+  width: auto;
+  flex: 1 1 180px;
+}
+.cast .message {
+  flex: 1 1 100%;
+  margin: 0;
+}
 @media (max-width: 900px) {
   #devices {
     grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -1,4 +1,5 @@
 """Camera management for browsers on the local network."""
+import hmac
 import ipaddress
 import json
 import os
@@ -18,7 +19,7 @@ MEDIA_KEY = os.environ.get("NESTUNIFI_HLS_KEY", "")
 # Host names the owner reaches this page by, for example behind an own reverse proxy.
 NAMES = {name.strip().lower() for name in os.environ.get("NESTUNIFI_HOSTNAMES", "").split(",") if name.strip()}
 ACTIONS = {"list", "discover", "test", "rename", "add", "profile", "password", "remove", "pause", "view", "motiontest", "mix", "mixadd",
-           "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose"}
+           "castlist", "cast", "caststop", "setup", "client", "project", "consent", "code", "backup", "restore", "notify", "notifytest", "diagnose"}
 # Google returns the browser to /oauth2callback with the code in the query. The page itself hands it in.
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/oauth2callback": ("index.html", "text/html; charset=utf-8"),
           "/app.css": ("app.css", "text/css"), "/app.js": ("app.js", "text/javascript")}
@@ -26,10 +27,18 @@ for asset in (ASSETS / "assets").glob("*.svg"):
     STATIC["/assets/" + asset.name] = ("assets/" + asset.name, "image/svg+xml")
 STATIC["/assets/hls.light.min.js"] = ("assets/hls.light.min.js", "text/javascript")
 LIVE = re.compile(r"/live/(cam-[a-z0-9-]+|mix)/([A-Za-z0-9_-]+\.(?:m3u8|ts))")
+# A cast device plays a stream only when any website may read it. So it gets an address of its own that holds a
+# key no website can guess, and the address the page itself plays stays closed to other websites.
+CAST = re.compile(r"/cast/(cam-[a-z0-9-]+|mix)/([0-9a-f]{64})/([A-Za-z0-9_-]+\.(?:m3u8|ts))")
 # Every camera has a private listener inside the container, numbered 1 to 254, that gives its latest image.
 STILL = re.compile(r"/snapshot/([1-9]\d{0,2})\.jpg(?:\?\d{1,16})?")
 STILL_SOURCE = "http://127.0.0.%d/trigger/snapshot"
 direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # The media server is in this container.
+
+
+def cast_key(path):
+    """What stands in a path's cast address. The worker makes the same from the same secret."""
+    return hmac.new(MEDIA_KEY.encode(), path.encode(), "sha256").hexdigest()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -38,13 +47,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, status, data=b"", mime="application/json"):
+    def reply(self, status, data=b"", mime="application/json", shared=False):
         if not isinstance(data, bytes):
             data = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if shared:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
@@ -71,11 +82,11 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(403, "Open NestUnifi vanaf je thuisnetwerk via het IP-adres van dit systeem. Gebruik je een eigen "
                         "hostnaam, zet die dan in NESTUNIFI_HOSTNAMES.".encode(), "text/plain; charset=utf-8")
 
-    def video(self, camera, part):
+    def video(self, camera, part, shared=False):
         request = urllib.request.Request(MEDIA + camera + "/" + part, headers={"Authorization": "Bearer " + MEDIA_KEY})
         try:
             with direct.open(request, timeout=20) as source:
-                self.reply(200, source.read(), source.headers.get_content_type())
+                self.reply(200, source.read(), source.headers.get_content_type(), shared)
         except urllib.error.HTTPError as exc:
             exc.close()
             self.reply(exc.code, {})
@@ -98,6 +109,11 @@ class Handler(BaseHTTPRequestHandler):
         match = LIVE.fullmatch(self.path)
         if match:
             return self.video(match[1], match[2])
+        match = CAST.fullmatch(self.path)
+        if match:
+            if not MEDIA_KEY or not hmac.compare_digest(match[2], cast_key(match[1])):
+                return self.reply(404, {})
+            return self.video(match[1], match[3], True)
         match = STILL.fullmatch(self.path)
         if match and int(match[1]) <= 254:
             return self.still(int(match[1]))

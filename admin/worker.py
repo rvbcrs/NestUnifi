@@ -1,6 +1,7 @@
 """Camera-management requests received over the private Unix socket."""
 import base64
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import secrets
@@ -23,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I leaves the script directory out
+import cast
 import google_api
 import mixer
 from mixer import describe
@@ -551,7 +553,7 @@ def recover():
     PENDING.unlink()
 
 
-def change(action, req):
+def change(action, req, live=None):
     onvif = read(ONVIF)
     label = name_input(req.get("name")) if action in ("rename", "add", "mixadd") else None
     before = {str(ONVIF): copy.deepcopy(onvif)}
@@ -569,7 +571,7 @@ def change(action, req):
     elif action == "profile":
         cam = camera(onvif, req.get("id"))
         label = display(cam)
-        live = test_stream(req)
+        live = live or test_stream(req)
         if not live["live"]:
             raise Problem("Geen livebeeld beschikbaar om de resolutie te meten.")
         st = cam["streams"][0]
@@ -674,6 +676,30 @@ def test_stream(req):
     return {"live": False}
 
 
+def fit_profiles(done):
+    """A camera added while it gave no picture kept the usual 16:9 profile, and a recorder stretches its picture
+    to that. Each camera is measured once, when it has video, and a size of another shape is taken over. A size
+    of the same shape is left alone: Google lowers the size on a poor connection."""
+    state = read(STATE)
+    video = sessions(state)
+    for cam in read(ONVIF)["devices"]:
+        uid = cam["uuid"]
+        if (uid in done or "mix" in cam or cam.get("paused") or not state["cameras"].get(uid, {}).get("online")
+                or video.get(stream_path(cam), {}).get("state") not in ("live", "renewing")):
+            continue
+        live = test_stream({"id": uid})
+        if not live["live"]:
+            continue
+        done.add(uid)  # Also when taking it over fails: that waits a minute for the camera, with the page locked out.
+        st = cam["streams"][0]
+        if abs(live["width"] * st["height"] - st["width"] * live["height"]) * 50 <= st["width"] * live["height"]:
+            continue
+        with (PENDING.parent / "admin.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            recover()
+            change("profile", {"id": uid}, live)
+
+
 def prepare(media, bridge):
     """Give the media server what a camera mix needs: the sound paths, the bridge's right to publish on them and
     a user for the mixer. Tells whether anything was missing."""
@@ -713,6 +739,58 @@ def mix(req):
     if not start_mix(MIX, media):
         raise Problem("Het samenvoegen is niet gestart. Download de diagnose onder het tandwiel om te zien waarom.")
     return {"url": "/live/" + MIX + "/index.m3u8", "silent": [display(cam) for cam in cams if cam not in heard]}
+
+
+def view(req):
+    """Make sure a camera or a mix gives a picture, and tell where the page plays it."""
+    cam = camera(read(ONVIF), req.get("id"))
+    if "mix" in cam:
+        if not start_mix(stream_path(cam), read(MEDIA)):
+            raise Problem("Het samengestelde beeld is niet gestart. Geeft minstens één van zijn camera's beeld?")
+    elif source_live(cam) is False:
+        raise Problem("De bridge ontvangt geen video van " + display(cam) +
+                      ". Controleer het livebeeld in Google Home en probeer het opnieuw.")
+    return {"url": "/live/" + stream_path(cam) + "/index.m3u8"}
+
+
+def casting(action, req):
+    """Show a camera or a mix on a cast device in the home: a TV with Google TV, a Chromecast or a Nest Hub."""
+    if action == "castlist":
+        # The devices are asked for on the network the cameras are on, from the address of one of them.
+        source = next((c["ip"] for c in read(STATE)["cameras"].values() if c.get("online") and c.get("ip")), None)
+        if source is None:
+            raise Problem("Casten kan zodra een camera online is.")
+        try:
+            return {"devices": cast.find(source)}
+        except OSError:
+            raise Problem("Zoeken naar cast-apparaten is mislukt.")
+    try:
+        address = ipaddress.IPv4Address(req.get("address") if isinstance(req.get("address"), str) else "")
+    except ValueError:
+        address = None
+    if address is None or not address.is_private or address.is_loopback:
+        raise Problem("Kies een cast-apparaat uit de lijst.")
+    origin = req.get("origin") or ""
+    try:
+        if action == "caststop":
+            cast.stop(str(address))
+            return {}
+        trial = "ids" in req
+        path = (mix(req) if trial else view(req))["url"].split("/")[2]
+        key = hmac.new(read(MEDIA)["hlsCDNSecret"].encode(), path.encode(), "sha256").hexdigest()
+        # The device fetches the stream where this browser found the page.
+        cast.play(str(address), "%s/cast/%s/%s/index.m3u8" % (origin, path, key),
+                  "Samengesteld beeld" if trial else display(camera(read(ONVIF), req.get("id"))))
+    except cast.Refused:
+        try:
+            ipaddress.ip_address(urlsplit(origin).hostname or "")
+            hint = ""
+        except ValueError:
+            hint = " Open deze pagina via het IP-adres van dit systeem en probeer het opnieuw."
+        raise Problem("Het cast-apparaat speelt het beeld niet af." + hint)
+    except (OSError, ValueError, KeyError):
+        raise Problem("Het cast-apparaat reageert niet.")
+    return {}
 
 
 def bootstrap():
@@ -979,7 +1057,7 @@ def watch_health(state, problems, send, now):
 
 def watch():
     """Runs beside the request handler and turns detections and problems into webhook messages."""
-    state, checked, failure = {}, 0.0, None
+    state, checked, failure, fitted, measured = {}, 0.0, None, 0.0, set()
     while True:
         time.sleep(2)
         try:
@@ -996,6 +1074,9 @@ def watch():
             elif STATE.exists() and time.monotonic() - checked >= 60:
                 checked = time.monotonic()
                 watch_health(state, health_problems(), send, checked)
+            if STATE.exists() and time.monotonic() - fitted >= 60:
+                fitted = time.monotonic()
+                fit_profiles(measured)
             failure = None
         except Exception as exc:
             if type(exc) is not failure:  # Once per kind of failure, not every two seconds.
@@ -1129,14 +1210,9 @@ def dispatch(req):
     if action == "test":
         return test_stream(req)
     if action == "view":
-        cam = camera(read(ONVIF), req.get("id"))
-        if "mix" in cam:
-            if not start_mix(stream_path(cam), read(MEDIA)):
-                raise Problem("Het samengestelde beeld is niet gestart. Geeft minstens één van zijn camera's beeld?")
-        elif source_live(cam) is False:
-            raise Problem("De bridge ontvangt geen video van " + display(cam) +
-                          ". Controleer het livebeeld in Google Home en probeer het opnieuw.")
-        return {"url": "/live/" + stream_path(cam) + "/index.m3u8"}
+        return view(req)
+    if action in ("castlist", "cast", "caststop"):
+        return casting(action, req)
     if action in ("add", "mixadd", "rename", "profile", "password", "remove", "pause"):
         return change(action, req)
     if action == "diagnose":
