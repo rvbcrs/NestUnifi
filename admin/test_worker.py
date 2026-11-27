@@ -376,11 +376,17 @@ class CameraChanges(unittest.TestCase):
                   + record(label("Groep") + service, 16, text("fn=Alle speakers", "ca=199172")))  # Sound only.
         self.assertEqual(cast.devices(answer, "192.168.1.30"),
                          [{"name": "Keuken Display", "model": "Google Nest Hub", "address": "192.168.1.30"}])
-        heard = []
+        heard, finished = [], threading.Semaphore(0)
         apps = [{"appId": cast.PLAYER, "transportId": "t-1", "sessionId": "s-1"}, {"appId": "other", "sessionId": "s-2"}]
 
         class Device(socketserver.BaseRequestHandler):
             def handle(self):
+                try:
+                    self.serve()
+                finally:
+                    finished.release()  # The device has read all it was sent.
+
+            def serve(self):
                 say = lambda namespace, data: self.request.sendall(cast.pack("receiver-0", "*", namespace, data))
                 while True:
                     head = self.request.recv(4, 0x100)  # MSG_WAITALL
@@ -411,8 +417,11 @@ class CameraChanges(unittest.TestCase):
                 "metadata": {"metadataType": 0, "title": "Tuin"}})
             with self.assertRaises(cast.Refused):
                 cast.play("192.168.1.30", "http://nas/bad", "Tuin")
+            for _ in range(2):
+                self.assertTrue(finished.acquire(timeout=5))
             heard.clear()
             cast.stop("192.168.1.30")
+            self.assertTrue(finished.acquire(timeout=5))
             # Only our own player is ended.
             self.assertEqual([data.get("sessionId", data["type"]) for _, data in heard], ["CONNECT", "GET_STATUS", "PONG", "s-1", "PONG"])
 
