@@ -73,7 +73,16 @@ function renderDevices() {
     setup.setAttribute("aria-label", setup.title);
     setup.className = "icon-button setup";
     setup.append(icon("gear-six"));
-    footer.append(status, play, setup);
+    footer.append(status, play);
+    if (cam.live && !cam.paused) {
+      const share = button("", () => castTo(cam));
+      share.title = cam.name + " casten naar een scherm";
+      share.setAttribute("aria-label", share.title);
+      share.className = "icon-button setup";
+      share.append(icon("screencast"));
+      footer.append(share);
+    }
+    footer.append(setup);
     row.append(open, head, footer);
     if (withStills) {
       // The camera's latest image. A camera without one gets the empty frame, so every card is as tall.
@@ -234,6 +243,12 @@ function castRow(cam) {
   row.append(search, note);
   return row;
 }
+function castTo(cam) {
+  modal(cam.name + " casten");
+  const row = castRow(cam);
+  el("fields").append(row);
+  row.querySelector("button").click();  // Look for the devices right away.
+}
 async function watch(cam, reconnect = true) {
   const epoch = modal(cam.name);
   el("modal").classList.add("viewer");
@@ -285,7 +300,7 @@ async function watch(cam, reconnect = true) {
     clearTimeout(startupTimer);
     startupTimer = setTimeout(interrupted, 45000);
     if (silent.length) el("fields").append(make("p", "Geen geluid van " + silent.join(", ") + "."));
-    el("fields").append(castRow(cam));
+    if (cam.trial) el("fields").append(castRow(cam));  // A mix being tried out has no card to cast from.
     if (window.Hls && Hls.isSupported()) {
       player = new Hls({enableWorker: false, lowLatencyMode: false});
       player.on(Hls.Events.ERROR, (_, data) => {
